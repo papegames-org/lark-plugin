@@ -1,8 +1,34 @@
 {
   "name": "lark-scope-preauth",
   "version": "2.0.0",
+  "description": "OpenClaw plugin that pre-authorizes Feishu scopes declared by SKILL.md before skill use.",
   "type": "module",
   "main": "index.js",
+  "files": [
+    "docs",
+    "feishu-runtime.js",
+    "index.js",
+    "openclaw.plugin.json",
+    "pending-auth.js",
+    "parse-meta.js",
+    "utils.js",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "feishu",
+    "lark",
+    "auth"
+  ],
+  "license": "MIT",
   "openclaw": {
     "extensions": ["./index.js"]
   }

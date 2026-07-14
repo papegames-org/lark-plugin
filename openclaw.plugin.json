@@ -18,7 +18,7 @@
       },
       "blockRead": {
         "type": "boolean",
-        "description": "If true, block/approve read until scopes granted. Default false (let read through, send auth link async)."
+        "description": "If true, block/approve read until scopes granted. Default true."
       },
       "skillRoots": {
         "type": "array",
