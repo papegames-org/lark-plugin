@@ -1,6 +1,6 @@
 # OpenClaw Gateway Notes
 
-This note collects the OpenClaw plugin and gateway behaviors that matter most to `lark-scope-preauth`.
+This note collects the OpenClaw plugin and gateway behaviors that matter most to `openclaw-skill-runtime`.
 
 ## 1. Plugin install and load path
 
@@ -49,7 +49,7 @@ OpenClaw distinguishes between:
 - internal file-based hooks for coarse automation
 - typed plugin hooks via `api.on(...)` for runtime lifecycle control
 
-`lark-scope-preauth` is correctly using typed plugin hooks today because it needs to inspect and potentially block `read` calls at runtime.
+`openclaw-skill-runtime` is correctly using typed plugin hooks today because it needs to inspect and potentially block `read` calls at runtime.
 
 This is the right long-term extension surface.
 
@@ -90,7 +90,7 @@ Implication:
 - prefer `openclaw plugins inspect <id> --runtime --json` over assuming manifest discovery is enough
 - prefer `openclaw gateway status --require-rpc` over plain reachability checks when debugging live behavior
 
-## 8. What this means for `lark-scope-preauth`
+## 8. What this means for `openclaw-skill-runtime`
 
 The plugin should evolve in this direction:
 
@@ -104,7 +104,7 @@ The plugin should evolve in this direction:
 
 When debugging a production installation:
 
-1. `openclaw plugins inspect lark-scope-preauth --runtime --json`
+1. `openclaw plugins inspect openclaw-skill-runtime --runtime --json`
 2. `openclaw gateway status --require-rpc`
 3. `openclaw logs --follow`
 4. if plugin code changed, do a full Gateway restart

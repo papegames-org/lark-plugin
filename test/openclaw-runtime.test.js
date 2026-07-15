@@ -10,9 +10,9 @@ test("extractPluginConfigHints reads common config surfaces", () => {
   const hints = extractPluginConfigHints({
     config: {
       plugins: {
-        allow: ["lark-scope-preauth"],
+        allow: ["openclaw-skill-runtime"],
         entries: {
-          "lark-scope-preauth": {
+          "openclaw-skill-runtime": {
             enabled: true,
             config: { blockRead: true },
           },
@@ -22,7 +22,7 @@ test("extractPluginConfigHints reads common config surfaces", () => {
   });
 
   assert.deepEqual(hints, {
-    pluginId: "lark-scope-preauth",
+    pluginId: "openclaw-skill-runtime",
     hasEntry: true,
     enabled: true,
     configPresent: true,
@@ -46,14 +46,14 @@ test("formatOpenClawDoctorReport renders gateway and runtime status", () => {
     pluginConfig: {
       ok: false,
       checked: false,
-      pluginId: "lark-scope-preauth",
+      pluginId: "openclaw-skill-runtime",
       error: "openclaw CLI unavailable",
       hints: null,
     },
     pluginRuntime: {
       ok: false,
       checked: false,
-      pluginId: "lark-scope-preauth",
+      pluginId: "openclaw-skill-runtime",
       error: "openclaw CLI unavailable",
     },
   });

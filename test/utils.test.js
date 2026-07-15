@@ -8,6 +8,7 @@ import {
   getCachedSenderId,
   getDefaultSkillRoots,
   getAccountCredentials,
+  inferSenderIdFromCtx,
   getSkillAuthCacheKey,
   resolveSkillReadTarget,
   sendAuthCard,
@@ -65,9 +66,23 @@ test("resolveSkillReadTarget recognizes direct OpenClaw skill reads without work
   );
 });
 
+test("inferSenderIdFromCtx falls back to channelId when it already carries a Feishu open_id", () => {
+  assert.equal(
+    inferSenderIdFromCtx({ channelId: "ou_4fc048c59c4820feda9d591cd213b480" }),
+    "ou_4fc048c59c4820feda9d591cd213b480",
+  );
+});
+
 test("cacheSenderId restores sender identity across hooks", () => {
   cacheSenderId({ sessionId: "session-a" }, "ou_123");
   assert.equal(getCachedSenderId({ sessionId: "session-a" }), "ou_123");
+});
+
+test("getCachedSenderId can reuse Feishu channelId as a direct sender fallback", () => {
+  assert.equal(
+    getCachedSenderId({ channelId: "ou_4fc048c59c4820feda9d591cd213b480" }),
+    "ou_4fc048c59c4820feda9d591cd213b480",
+  );
 });
 
 test("sendAuthCard prefers plugin feishu message tool when available", async () => {
@@ -113,6 +128,31 @@ test("getAccountCredentials resolves app credentials from account config", async
 
   await assert.doesNotReject(async () => {
     assert.deepEqual(await getAccountCredentials({ accountId: "acc-a" }), {
+      accountId: "acc-a",
+      appId: "cli_123",
+      appSecret: "secret_123",
+      brand: "feishu",
+      domain: null,
+    });
+  });
+});
+
+test("getAccountCredentials ignores legacy unknown accountId and falls back to the single configured account", async () => {
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          "acc-a": {
+            appId: "cli_123",
+            appSecret: "secret_123",
+          },
+        },
+      },
+    },
+  });
+
+  await assert.doesNotReject(async () => {
+    assert.deepEqual(await getAccountCredentials({ accountId: "unknown" }), {
       accountId: "acc-a",
       appId: "cli_123",
       appSecret: "secret_123",

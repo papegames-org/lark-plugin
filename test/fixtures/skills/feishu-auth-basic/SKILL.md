@@ -8,7 +8,7 @@ metadata: { "openclaw": { "larkAuth": { "identity": "user", "scopes": ["contact:
 
 This is a minimal fixture skill used to validate that:
 
-- `lark-scope-preauth` can detect a `SKILL.md`
+- `openclaw-skill-runtime` can detect a `SKILL.md`
 - the inline `metadata.openclaw.larkAuth` format is parsed correctly
 - a missing scope can trigger the normal auth-card path
 

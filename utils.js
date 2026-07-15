@@ -1,4 +1,4 @@
-// utils.js — Lark Scope Pre-Auth 工具函数集
+// utils.js — OpenClaw Skill Runtime 工具函数集
 // 包含：日志、workspace 查找、skill-map 构建、auth 操作等（frontmatter 解析已移至 parse-meta.js）
 // ============================================================
 
@@ -40,7 +40,7 @@ export function resetRuntimeCaches() {
 // ---------- 日志 ----------
 
 export function fileLog(msg) {
-  console.log(`[lark-scope-preauth] ${new Date().toISOString()} ${msg}`);
+  console.log(`[openclaw-skill-runtime] ${new Date().toISOString()} ${msg}`);
 }
 
 export function logCtxSnapshotOnce(ctx) {
@@ -122,6 +122,21 @@ export function resolveSkillReadTarget(rawPath, cwd, wsDir) {
   };
 }
 
+export function inferSenderIdFromCtx(ctx) {
+  const candidates = [
+    ctx?.senderId,
+    ctx?.senderOpenId,
+    ctx?.openId,
+    ctx?.channelId,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && /^ou_[A-Za-z0-9]/.test(value.trim())) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
 export function cacheSenderId(ctx, senderId) {
   if (!senderId) return;
   if (ctx?.sessionId) cachedSenderBySession.set(ctx.sessionId, senderId);
@@ -129,8 +144,9 @@ export function cacheSenderId(ctx, senderId) {
 }
 
 export function getCachedSenderId(ctx) {
-  if (ctx?.senderId || ctx?.senderOpenId || ctx?.openId) {
-    return ctx.senderId || ctx.senderOpenId || ctx.openId;
+  const direct = inferSenderIdFromCtx(ctx);
+  if (direct) {
+    return direct;
   }
   if (ctx?.sessionId && cachedSenderBySession.has(ctx.sessionId)) {
     return cachedSenderBySession.get(ctx.sessionId);
@@ -208,14 +224,38 @@ export function parseJsonLoose(text) {
   return null;
 }
 
+function formatError(error) {
+  if (!error) return "unknown error";
+  const parts = [];
+  if (error?.name) parts.push(`name=${error.name}`);
+  if (error?.message) parts.push(`message=${error.message}`);
+  if (error?.cause) {
+    if (typeof error.cause === "object") {
+      const causeMessage = error.cause?.message || error.cause?.code || JSON.stringify(error.cause);
+      parts.push(`cause=${causeMessage}`);
+    } else {
+      parts.push(`cause=${String(error.cause)}`);
+    }
+  }
+  if (parts.length === 0) return String(error);
+  return parts.join(" ");
+}
+
+function normalizeAccountId(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "unknown") return null;
+  return trimmed;
+}
+
 export function getAccountId(ctx) {
-  const direct = ctx?.accountId || ctx?.account || ctx?.channelAccountId || null;
+  const direct = normalizeAccountId(ctx?.accountId) || normalizeAccountId(ctx?.account) || normalizeAccountId(ctx?.channelAccountId) || null;
   if (direct) return direct;
   if (ctx?.sessionId && cachedAccountBySession.has(ctx.sessionId)) {
-    return cachedAccountBySession.get(ctx.sessionId);
+    return normalizeAccountId(cachedAccountBySession.get(ctx.sessionId));
   }
   if (ctx?.sessionKey && cachedAccountBySession.has(ctx.sessionKey)) {
-    return cachedAccountBySession.get(ctx.sessionKey);
+    return normalizeAccountId(cachedAccountBySession.get(ctx.sessionKey));
   }
   fileLog(`getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} cacheSize=${cachedAccountBySession.size}`);
   return null;
@@ -318,22 +358,24 @@ export async function getAppScopes(ctx) {
     return cached.promise;
   }
 
-  const promise = callFeishuOpenApi(credentials, {
+  const combinedPromise = callFeishuOpenApi(credentials, {
     method: "GET",
     path: `/open-apis/application/v6/applications/${aid}`,
     params: { lang: "zh_cn" },
   }).then((response) => {
     if (!response || response.code !== 0) {
       fileLog(`getAppScopes: API failed: ${response?.msg || response?.message || "unparseable"}`);
-      appScopesCache.delete(aid);
       return null;
     }
     const scopesArr = response?.data?.app?.scopes;
     if (!Array.isArray(scopesArr)) {
-      appScopesCache.delete(aid);
       return null;
     }
     const scopes = [...new Set(scopesArr.map((item) => item?.scope).filter(Boolean))];
+    if (!scopes) {
+      appScopesCache.delete(aid);
+      return null;
+    }
     appScopesCache.set(aid, {
       scopes,
       expiresAt: Date.now() + APP_SCOPES_CACHE_TTL_MS,
@@ -341,13 +383,13 @@ export async function getAppScopes(ctx) {
     });
     return scopes;
   }).catch((error) => {
-    fileLog(`getAppScopes: request failed: ${error?.message || error}`);
+    fileLog(`getAppScopes: request failed: ${formatError(error)}`);
     appScopesCache.delete(aid);
     return null;
   });
 
-  appScopesCache.set(aid, { scopes: null, expiresAt: 0, promise });
-  return promise;
+  appScopesCache.set(aid, { scopes: null, expiresAt: 0, promise: combinedPromise });
+  return combinedPromise;
 }
 
 export async function checkScopes(scopes, ctx) {
@@ -374,6 +416,7 @@ export async function startLogin(missing, ctx) {
       scopes: missing,
     });
   } catch (error) {
+    fileLog(`startLogin: request failed: ${formatError(error)}`);
     return { error: String(error?.message || error) };
   }
 }
@@ -429,6 +472,7 @@ const activePollingIntervals = new Map();
 async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
   if (!openId) return { error: "no openId" };
   if (pluginApiRef?.tools?.feishu_im_user_message) {
+    fileLog(`sendInteractiveCard: using plugin tool for openId=${openId}`);
     try {
       const response = await pluginApiRef.tools.feishu_im_user_message({
         action: "send",
@@ -441,11 +485,14 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
         messageId: response?.data?.message_id || response?.message_id || response?.id || (response?.success ? "sent" : null),
       };
     } catch (error) {
-      fileLog(`sendInteractiveCard: plugin tool failed: ${error?.message || error}`);
+      fileLog(`sendInteractiveCard: plugin tool failed: ${formatError(error)}`);
     }
+  } else {
+    fileLog(`sendInteractiveCard: plugin tool unavailable, falling back to HTTP openId=${openId}`);
   }
   const credentials = await getAccountCredentials(ctx);
   try {
+    fileLog(`sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} openId=${openId}`);
     const response = await callFeishuOpenApi(credentials, {
       method: "POST",
       path: "/open-apis/im/v1/messages",
@@ -458,7 +505,7 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
     });
     return { messageId: response?.data?.message_id || null };
   } catch (error) {
-    return { error: String(error?.message || error) };
+    return { error: formatError(error) };
   }
 }
 

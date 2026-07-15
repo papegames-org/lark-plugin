@@ -1,5 +1,5 @@
 {
-  "name": "lark-scope-preauth",
+  "name": "openclaw-skill-runtime",
   "version": "2.0.0",
   "description": "OpenClaw plugin that pre-authorizes Feishu scopes declared by SKILL.md before skill use.",
   "type": "module",

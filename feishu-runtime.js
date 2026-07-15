@@ -2,19 +2,34 @@ import { gzipSync } from "node:zlib";
 
 const tenantTokenCache = new Map();
 
+function isUsableHostname(hostname) {
+  if (!hostname) return false;
+  if (hostname === "localhost") return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return true;
+  if (hostname.includes(":")) return true;
+  return hostname.includes(".");
+}
+
 function toHttpsOrigin(value) {
   if (!value) return null;
   const source = String(value).trim();
   if (!source) return null;
   try {
-    return new URL(source).origin;
+    const direct = new URL(source);
+    return isUsableHostname(direct.hostname) ? direct.origin : null;
   } catch {
-    return `https://${source.replace(/^\/+|\/+$/g, "")}`;
+    try {
+      const normalized = new URL(`https://${source.replace(/^\/+|\/+$/g, "")}`);
+      return isUsableHostname(normalized.hostname) ? normalized.origin : null;
+    } catch {
+      return null;
+    }
   }
 }
 
 export function resolveFeishuBrand(domain) {
   const normalized = String(domain || "").toLowerCase();
+  if (normalized === "lark") return "lark";
   if (normalized.includes("larksuite")) return "lark";
   return "feishu";
 }
@@ -49,7 +64,7 @@ function encodeAddons(addons) {
     .replace(/=+$/g, "");
 }
 
-export async function beginScopeGrantFlow({ appId, brand, scopes, source = "lark-scope-preauth" }) {
+export async function beginScopeGrantFlow({ appId, brand, scopes, source = "openclaw-skill-runtime" }) {
   if (!Array.isArray(scopes) || scopes.length === 0) {
     throw new Error("no scopes");
   }

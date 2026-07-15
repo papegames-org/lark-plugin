@@ -20,7 +20,7 @@ export function resolvePendingAuthBaseDir(options = {}) {
 
 export function getPendingAuthNoticeStorePath(options = {}) {
   const baseDir = resolvePendingAuthBaseDir(options);
-  return join(baseDir, "plugins", "lark-scope-preauth", "pending-auth-notices.json");
+  return join(baseDir, "plugins", "openclaw-skill-runtime", "pending-auth-notices.json");
 }
 
 export function computePendingAuthRetryDelayMs(attemptCount) {

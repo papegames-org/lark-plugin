@@ -19,9 +19,11 @@ import {
   checkScopes,
   fileLog,
   getAuthedUser,
+  getAccountId,
   getCachedSenderId,
   getDefaultSkillRoots,
   getSkillAuthCacheKey,
+  inferSenderIdFromCtx,
   ensureFeishuRuntimeHealth,
   logCtxSnapshotOnce,
   resolvePath,
@@ -53,9 +55,11 @@ const baseDeps = {
   checkScopes,
   fileLog,
   getAuthedUser,
+  getAccountId,
   getCachedSenderId,
   getDefaultSkillRoots,
   getSkillAuthCacheKey,
+  inferSenderIdFromCtx,
   ensureFeishuRuntimeHealth,
   logCtxSnapshotOnce,
   resolvePath,
@@ -90,9 +94,11 @@ export function createPluginEntry(overrides = {}) {
     checkScopes,
     fileLog,
     getAuthedUser,
+    getAccountId,
     getCachedSenderId,
     getDefaultSkillRoots,
     getSkillAuthCacheKey,
+    inferSenderIdFromCtx,
     ensureFeishuRuntimeHealth,
     logCtxSnapshotOnce,
     resolvePath,
@@ -106,10 +112,85 @@ export function createPluginEntry(overrides = {}) {
     startWaitForAuth,
   } = deps;
 
+  function safeJson(value) {
+    const seen = new WeakSet();
+    return JSON.stringify(value, (key, current) => {
+      if (typeof current === "object" && current !== null) {
+        if (seen.has(current)) return "[Circular]";
+        seen.add(current);
+      }
+      if (typeof current === "string") {
+        return current.length > 240 ? `${current.slice(0, 240)}…` : current;
+      }
+      if (Array.isArray(current) && current.length > 12) {
+        return [...current.slice(0, 12), `…(+${current.length - 12} more)`];
+      }
+      return current;
+    });
+  }
+
+  function buildHookDebugSummary(event, ctx) {
+    return {
+      eventKeys: event ? Object.keys(event) : null,
+      ctxKeys: ctx ? Object.keys(ctx) : null,
+      eventTrigger: event?.trigger || null,
+      ctxTrigger: ctx?.trigger || null,
+      eventSkillCommand: event?.skillCommand || null,
+      ctxSkillCommand: ctx?.skillCommand || null,
+      eventSkillName: event?.skillName || null,
+      ctxSkillName: ctx?.skillName || null,
+      eventParams: event?.params || null,
+      ctxMessageProvider: ctx?.messageProvider || null,
+      ctxChannel: ctx?.channel || null,
+      ctxChannelId: ctx?.channelId || null,
+      ctxAccountId: ctx?.accountId || ctx?.account || null,
+      ctxSessionId: ctx?.sessionId || null,
+      ctxSessionKey: ctx?.sessionKey || null,
+      ctxTraceKeys: ctx?.trace ? Object.keys(ctx.trace) : null,
+      ctxTraceSkillCommand: ctx?.trace?.skillCommand || null,
+      ctxTraceTrigger: ctx?.trace?.trigger || null,
+      ctxSkillsSnapshotNames: Array.isArray(ctx?.skillsSnapshot?.resolvedSkills)
+        ? ctx.skillsSnapshot.resolvedSkills.map((item) => item?.name).filter(Boolean)
+        : null,
+      eventSkillsSnapshotNames: Array.isArray(event?.skillsSnapshot?.resolvedSkills)
+        ? event.skillsSnapshot.resolvedSkills.map((item) => item?.name).filter(Boolean)
+        : null,
+    };
+  }
+
+  function normalizeSkillName(value) {
+    return typeof value === "string" && value.trim()
+      ? value.trim()
+      : null;
+  }
+
+  function getResolvedSkillNames(snapshot) {
+    if (!Array.isArray(snapshot?.resolvedSkills)) return [];
+    return snapshot.resolvedSkills
+      .map((item) => normalizeSkillName(item?.name || item?.skillName))
+      .filter(Boolean);
+  }
+
+  function collectSkillNameCandidates(event, ctx, directTarget) {
+    return [...new Set([
+      normalizeSkillName(directTarget?.skillName),
+      normalizeSkillName(ctx?.skillCommand?.skillName),
+      normalizeSkillName(event?.skillCommand?.skillName),
+      normalizeSkillName(ctx?.trace?.skillCommand?.skillName),
+      normalizeSkillName(event?.trace?.skillCommand?.skillName),
+      normalizeSkillName(ctx?.skillName),
+      normalizeSkillName(event?.skillName),
+      ...getResolvedSkillNames(ctx?.skillsSnapshot),
+      ...getResolvedSkillNames(event?.skillsSnapshot),
+      ...getResolvedSkillNames(ctx?.trace?.skillsSnapshot),
+      ...getResolvedSkillNames(event?.trace?.skillsSnapshot),
+    ].filter(Boolean))];
+  }
+
   // ---------- 主入口（直接导出 plain entry object，无需 definePluginEntry）----------
   return {
-    id: "lark-scope-preauth",
-    name: "Lark Scope Pre-Auth",
+    id: "openclaw-skill-runtime",
+    name: "OpenClaw Skill Runtime",
     description:
       "Ensure user Lark scopes declared in a skill's SKILL.md are granted before the skill is used.",
     register(api) {
@@ -133,7 +214,7 @@ export function createPluginEntry(overrides = {}) {
     const blockRead = cfg.blockRead !== false;
     ensureFeishuRuntimeHealth().then((info) => {
       if (!info.ok) {
-        api.log?.warn?.(`[lark-scope-preauth] feishu runtime unavailable: ${info.error || "unknown error"}. ${info.recoveryHint || ""}`.trim());
+        api.log?.warn?.(`[openclaw-skill-runtime] feishu runtime unavailable: ${info.error || "unknown error"}. ${info.recoveryHint || ""}`.trim());
       }
     }).catch((error) => {
       fileLog(`runtime health check failed: ${error?.message || error}`);
@@ -149,14 +230,14 @@ export function createPluginEntry(overrides = {}) {
         entry = { cacheKey, roots, map };
         skillMapCache.set(cacheKey, entry);
         const banner = `indexed ${map.size} SKILL.md across ${roots.length} roots (blockRead=${blockRead}) cacheKey=${cacheKey}`;
-        api.log?.info?.(`[lark-scope-preauth] ${banner}`);
+        api.log?.info?.(`[openclaw-skill-runtime] ${banner}`);
         fileLog(banner);
       }
       return entry;
     }
 
     const pendingAuthStorePath = getPendingAuthNoticeStorePath();
-    fileLog(`register: pluginId=lark-scope-preauth apiConfig=${apiConfigRef ? "present" : "null"} feishuAccounts=${apiConfigRef?.channels?.feishu?.accounts ? Object.keys(apiConfigRef.channels.feishu.accounts).join(",") : "<none>"} incomingHadAccounts=${incomingHasAccounts} enabled=${cfg.enabled !== false} blockRead=${cfg.blockRead !== false} skillRoots=${Array.isArray(cfg.skillRoots) ? cfg.skillRoots.length : 0} pendingAuthStorePath=${pendingAuthStorePath}`);
+    fileLog(`register: pluginId=openclaw-skill-runtime apiConfig=${apiConfigRef ? "present" : "null"} feishuAccounts=${apiConfigRef?.channels?.feishu?.accounts ? Object.keys(apiConfigRef.channels.feishu.accounts).join(",") : "<none>"} incomingHadAccounts=${incomingHasAccounts} enabled=${cfg.enabled !== false} blockRead=${cfg.blockRead !== false} skillRoots=${Array.isArray(cfg.skillRoots) ? cfg.skillRoots.length : 0} pendingAuthStorePath=${pendingAuthStorePath}`);
     let pendingAuthRuntime = sharedPendingAuthRuntimeByStorePath.get(pendingAuthStorePath);
     if (!pendingAuthRuntime) {
       pendingAuthRuntime = {
@@ -313,6 +394,7 @@ export function createPluginEntry(overrides = {}) {
         cachedWorkspaceBySession.set(ctx.sessionId, ctx.workspaceDir);
       }
       fileLog(`before_prompt_build ctx keys=${ctx ? JSON.stringify(Object.keys(ctx)) : "null"} accountId=${ctx?.accountId || "<none>"} account=${ctx?.account || "<none>"} channel=${ctx?.channel || "<none>"} messageProvider=${ctx?.messageProvider || "<none>"} channelId=${ctx?.channelId || "<none>"}`);
+      fileLog(`before_prompt_build summary=${safeJson(buildHookDebugSummary(event, ctx))}`);
       const acc = ctx?.accountId || ctx?.account || null;
       if (acc && ctx?.sessionId) {
         cachedAccountBySession.set(ctx.sessionId, acc);
@@ -322,6 +404,12 @@ export function createPluginEntry(overrides = {}) {
       if (senderId) {
         cacheSenderId(ctx, senderId);
         fileLog(`senderId: cached from before_prompt_build sessionId=${ctx?.sessionId || "<none>"} -> ${senderId}`);
+      } else {
+        const inferredSenderId = inferSenderIdFromCtx(ctx);
+        if (inferredSenderId) {
+          cacheSenderId(ctx, inferredSenderId);
+          fileLog(`senderId: inferred from before_prompt_build sessionId=${ctx?.sessionId || "<none>"} channelId=${ctx?.channelId || "<none>"} -> ${inferredSenderId}`);
+        }
       }
     });
 
@@ -331,6 +419,7 @@ export function createPluginEntry(overrides = {}) {
       const skey = ctx?.sessionKey || event?.sessionKey || null;
       const senderId = event?.senderId || ctx?.senderId || event?.sender?.id || event?.senderOpenId || ctx?.senderOpenId || null;
       fileLog(`message_received accountId=${acc || "<none>"} sessionId=${sid || "<none>"} sessionKey=${skey || "<none>"} eventKeys=${event ? JSON.stringify(Object.keys(event)) : "null"}`);
+      fileLog(`message_received summary=${safeJson(buildHookDebugSummary(event, ctx))}`);
       if (acc) {
         if (sid) cachedAccountBySession.set(sid, acc);
         if (skey) cachedAccountBySession.set(skey, acc);
@@ -345,41 +434,71 @@ export function createPluginEntry(overrides = {}) {
       try {
         logCtxSnapshotOnce(ctx);
         fileLog(`hook: tool=${event?.toolName || ""} channel=${ctx?.channel || ""} path=${event?.params?.path || ""}`);
-        if (event.toolName !== "read") return;
-        fileLog(`hook: read-enter rawPath=${event?.params?.path || ""} cwd=${ctx?.cwd || ""}`);
+        fileLog(`before_tool_call summary=${safeJson(buildHookDebugSummary(event, ctx))}`);
         if (ctx && ctx.channel && ctx.channel !== "feishu") return;
         const rawPath = event.params?.path;
-        const skillCommandName = typeof ctx?.skillCommand?.skillName === "string" && ctx.skillCommand.skillName.trim()
-          ? ctx.skillCommand.skillName.trim()
-          : null;
-        if (!rawPath && !skillCommandName) return;
         const wsDir = resolveWorkspaceDir(ctx);
         const directTarget = resolveSkillReadTarget(rawPath, ctx?.cwd, wsDir);
+        const skillNameCandidates = collectSkillNameCandidates(event, ctx, directTarget);
+        const isReadTool = event.toolName === "read";
+        if (!isReadTool && skillNameCandidates.length === 0) return;
+        if (isReadTool) {
+          fileLog(`hook: read-enter rawPath=${event?.params?.path || ""} cwd=${ctx?.cwd || ""}`);
+        } else {
+          fileLog(`hook: skill-runtime-enter tool=${event?.toolName || ""} skillCandidates=${skillNameCandidates.join(",") || "<none>"}`);
+        }
+        if (!rawPath && skillNameCandidates.length === 0) return;
         if (!ctx?.senderId) {
           const cachedSenderId = getCachedSenderId(ctx);
           if (cachedSenderId) {
             try { ctx.senderId = cachedSenderId; } catch {}
             fileLog(`senderId: restored for before_tool_call sessionId=${ctx?.sessionId || "<none>"} -> ${cachedSenderId}`);
+          } else {
+            const inferredSenderId = inferSenderIdFromCtx(ctx);
+            if (inferredSenderId) {
+              try { ctx.senderId = inferredSenderId; } catch {}
+              cacheSenderId(ctx, inferredSenderId);
+              fileLog(`senderId: inferred for before_tool_call sessionId=${ctx?.sessionId || "<none>"} channelId=${ctx?.channelId || "<none>"} -> ${inferredSenderId}`);
+            }
           }
         }
         const skillMapEntry = getSkillMapEntry(ctx);
         const abs = directTarget?.abs || resolvePath(rawPath, ctx?.cwd, wsDir);
-        let skillName = skillMapEntry.map.get(abs) || directTarget?.skillName || skillCommandName || null;
+        let skillName = skillMapEntry.map.get(abs) || directTarget?.skillName || null;
         let skillPath = abs;
-        if (!skillPath && skillCommandName) {
-          for (const [candidatePath, candidateSkillName] of skillMapEntry.map.entries()) {
-            if (candidateSkillName === skillCommandName) {
-              skillPath = candidatePath;
-              break;
-            }
+        if (!skillName && abs) {
+          const fallbackTarget = resolveSkillReadTarget(abs, "/", wsDir);
+          if (fallbackTarget?.skillName) {
+            skillName = fallbackTarget.skillName;
+            skillPath = fallbackTarget.abs;
+            fileLog(`fallback: derived skillName="${skillName}" directly from abs path="${abs}"`);
           }
+        }
+        if (!skillPath && skillNameCandidates.length > 0) {
+          for (const candidateName of skillNameCandidates) {
+            for (const [candidatePath, candidateSkillName] of skillMapEntry.map.entries()) {
+              if (candidateSkillName === candidateName) {
+                skillName = candidateName;
+                skillPath = candidatePath;
+                break;
+              }
+            }
+            if (skillPath) break;
+          }
+        }
+        if (!skillName && skillNameCandidates.length > 0) {
+          skillName = skillNameCandidates[0];
         }
         if (!skillName && Array.isArray(ctx?.skillsSnapshot?.resolvedSkills)) {
           const matchedSkill = ctx.skillsSnapshot.resolvedSkills.find((item) => item?.name && item.name === directTarget?.skillName);
           if (matchedSkill?.name) skillName = matchedSkill.name;
         }
+        if (!skillName && Array.isArray(event?.skillsSnapshot?.resolvedSkills)) {
+          const matchedSkill = event.skillsSnapshot.resolvedSkills.find((item) => item?.name && item.name === directTarget?.skillName);
+          if (matchedSkill?.name) skillName = matchedSkill.name;
+        }
         if (!skillName) {
-          fileLog(`debug: no match for abs="${abs}" rawPath="${rawPath}" in skillMap (size=${skillMapEntry.map.size}, keys.examples=${[...skillMapEntry.map.keys()].slice(0, 3).join(", ")})`);
+          fileLog(`debug: no match for abs="${abs}" rawPath="${rawPath}" skillCandidates=${skillNameCandidates.join(",") || "<none>"} in skillMap (size=${skillMapEntry.map.size}, keys.examples=${[...skillMapEntry.map.keys()].slice(0, 3).join(", ")})`);
           return;
         }
         if (!skillPath && skillName) {
@@ -413,8 +532,9 @@ export function createPluginEntry(overrides = {}) {
         }
         const missing = check.missing.length ? check.missing : larkAuth.scopes;
         fileLog(`skill="${skillName}" missing: ${missing.join(", ")}`);
-        api.log?.info?.(`[lark-scope-preauth] skill="${skillName}" missing: ${missing.join(", ")}`);
+        api.log?.info?.(`[openclaw-skill-runtime] skill="${skillName}" missing: ${missing.join(", ")}`);
         const now = Date.now();
+        const resolvedAccountId = getAccountId(ctx);
 
         let resolvedUser = null;
         const pendingNotice = pendingAuthNotices.get(authTargetKey);
@@ -466,7 +586,7 @@ export function createPluginEntry(overrides = {}) {
             missing,
             ...login,
             openId: user?.openId,
-            accountId: ctx?.accountId || ctx?.account || "unknown",
+            accountId: resolvedAccountId,
           });
           if (sent.messageId) {
             clearPendingAuthNotice(authTargetKey);
@@ -480,7 +600,7 @@ export function createPluginEntry(overrides = {}) {
               authTargetKey,
               skillName,
               skillPath,
-              accountId: ctx?.accountId || ctx?.account || "unknown",
+              accountId: resolvedAccountId,
               openId: user?.openId || null,
               missing,
               missingKey,

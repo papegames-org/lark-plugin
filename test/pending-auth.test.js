@@ -93,11 +93,11 @@ test("getPendingAuthNoticeStorePath prefers a stable OpenClaw data directory ove
     tmpDir: "/tmp/ignored",
   });
 
-  assert.equal(filePath, "/var/lib/openclaw-data/plugins/lark-scope-preauth/pending-auth-notices.json");
+  assert.equal(filePath, "/var/lib/openclaw-data/plugins/openclaw-skill-runtime/pending-auth-notices.json");
 });
 
 test("readPendingAuthNoticeStore restores retrying notices and prunes stale exhausted ones", () => {
-  const dir = mkdtempSync(join(tmpdir(), "lark-scope-preauth-pending-auth-"));
+  const dir = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-pending-auth-"));
   const filePath = join(dir, "pending-auth-notices.json");
 
   try {

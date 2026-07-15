@@ -109,7 +109,7 @@ function findPluginNode(payload, pluginId) {
   return null;
 }
 
-export function extractPluginConfigHints(payload, pluginId = "lark-scope-preauth") {
+export function extractPluginConfigHints(payload, pluginId = "openclaw-skill-runtime") {
   const pluginNode = findPluginNode(payload, pluginId);
   const entryNode = firstDefined(
     payload?.entries?.[pluginId],
@@ -173,7 +173,7 @@ export function extractPluginConfigHints(payload, pluginId = "lark-scope-preauth
   };
 }
 
-export async function collectOpenClawDoctorReport(pluginId = "lark-scope-preauth", options = {}) {
+export async function collectOpenClawDoctorReport(pluginId = "openclaw-skill-runtime", options = {}) {
   const cli = await inspectOpenClaw(options);
   if (!cli.ok) {
     return {
@@ -264,7 +264,7 @@ export function formatOpenClawDoctorReport(report) {
   if (report.pluginConfig?.error) lines.push(`- Plugin inspect error: ${report.pluginConfig.error}`);
   if (report.pluginRuntime.error) lines.push(`- Plugin runtime error: ${report.pluginRuntime.error}`);
   if (report.pluginRuntime.checked && !report.pluginRuntime.ok) {
-    lines.push("- Recovery hint: verify plugins.entries.lark-scope-preauth exists, the plugin is enabled, any plugin allowlist includes it, then restart Gateway and re-run doctor.");
+    lines.push("- Recovery hint: verify plugins.entries.openclaw-skill-runtime exists, the plugin is enabled, any plugin allowlist includes it, then restart Gateway and re-run doctor.");
   }
 
   return lines.join("\n");
