@@ -19,6 +19,12 @@ Use it when you want to verify that:
 - auth-card send failures enter the pending notice queue
 - retries survive restart and can be resumed on the next read
 
+When this fixture skill is actually executed, the response must begin with the fixed marker:
+
+`[FIXTURE-SKILL-TRIGGERED: feishu-auth-retry]`
+
+After the marker, add one short sentence confirming the retry fixture skill really ran.
+
 Suggested manual test:
 
 1. Force `sendAuthCard` to fail, or temporarily make the bot unable to send messages.
@@ -26,3 +32,4 @@ Suggested manual test:
 3. Confirm the read is still blocked.
 4. Confirm a pending notice is written and retries are scheduled.
 5. Restore message sending and read again to confirm the retry path recovers.
+6. After the retry path succeeds, confirm the reply starts with `[FIXTURE-SKILL-TRIGGERED: feishu-auth-retry]`.
