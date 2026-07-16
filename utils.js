@@ -22,6 +22,10 @@ let runtimeHealthCache = null;
 let pluginApiRef = null;
 const APP_SCOPES_CACHE_TTL_MS = 15000;
 const appScopesCache = new Map();
+const LARK_AUTH_CARD_ICON = {
+  tag: "custom_icon",
+  img_key: "img_v3_0013l_5b29ba19-9327-4eed-b5b9-3cd7f940494g",
+};
 
 /** 设置 api.config 引用（仅内部使用，由 register 在 index.js 调用） */
 export function setApiConfigRef(val) {
@@ -517,7 +521,7 @@ async function sendAuthSuccessCard({ skillName, openId, accountId }) {
       template: "green",
       title: { tag: "plain_text", content: "授权完成" },
       subtitle: { tag: "plain_text", content: `技能 “${skillName}” 已可使用` },
-      icon: { tag: "standard_icon", token: "check_outlined" },
+      icon: { ...LARK_AUTH_CARD_ICON },
     },
     body: {
       elements: [
@@ -609,7 +613,7 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
       template: "orange",
       title: { tag: "plain_text", content: "飞书权限授权提醒" },
       subtitle: { tag: "plain_text", content: `技能 “${skillName}” 需要你确认` },
-      icon: { tag: "standard_icon", token: "safe_outlined" },
+      icon: { ...LARK_AUTH_CARD_ICON },
     },
     body: {
       elements: [
