@@ -235,69 +235,11 @@ openclaw logs --follow
 
 更多 Gateway 侧笔记见 [docs/openclaw-gateway-notes.md](./docs/openclaw-gateway-notes.md)。
 
-## 版本管理与 npm 发布
+## 开发者补充说明
 
-这是一个要发布到 npm 的公共工具，版本和公开发布约束需要固定下来。
+面向维护者的版本管理、npm 发布和公开仓库安全约束，已经单独整理到 [docs/developer-release.md](./docs/developer-release.md)。
 
-### 版本管理规则
-
-以下文件的版本号必须保持一致：
-
-- `package.json`
-- `package-lock.json`
-- `openclaw.plugin.json`
-
-现在可以直接运行：
-
-```bash
-npm run check:version
-```
-
-每次发布前，先升级版本号，例如：
-
-```bash
-npm version patch
-```
-
-升级后再同步检查以上文件是否一致。
-
-### 发布前检查
-
-```bash
-npm run release:check
-```
-
-它会依次执行：
-
-- `check:version`：检查关键 manifest 版本是否一致
-- `test`：跑全部测试
-- `check:public`：扫描敏感信息与高风险文件
-- `pack:dry`：做一次 `npm pack --dry-run`
-
-### 发布到 npm
-
-```bash
-export NPM_TOKEN="你的 npm token"
-npm run release:publish
-```
-
-发布脚本会：
-
-- 强制使用 `https://registry.npmjs.org/`
-- 用临时 `.npmrc` 读取 `NPM_TOKEN`
-- 先执行 `release:check`
-- 发布结束后删除临时认证文件
-
-## 公开仓库敏感信息扫描
-
-`npm run check:public` 当前会重点拦这些风险：
-
-- 私钥块、OpenAI key、GitHub PAT、Slack token、AWS key、npm token
-- 明显像真实密钥的 `appSecret` / `client_secret` / `access_token` 赋值
-- `.npmrc`、`.env`、`id_rsa`、`.pem`、`.key` 这类高风险文件
-- 机器绝对路径、真实邮箱这类容易泄漏个人信息的内容
-
-这层扫描不是万能的，但至少能在发布前先拦住一批最常见的公共仓库事故。
+如果你要发版、调整发布脚本，或排查 `release:check` / `release:publish`，请优先看这份文档。
 
 ## 关键行为
 

@@ -146,6 +146,8 @@ const blockRead = cfg.blockRead !== false;
 
 这是一个发布到 npm 的公共工具，后续维护时把“版本一致”和“公开仓库安全”当成默认要求。
 
+更完整的发布步骤、检查项和 npm 发布说明见 [docs/developer-release.md](./docs/developer-release.md)。
+
 - 以下文件版本号应保持一致：
   - `package.json`
   - `package-lock.json`

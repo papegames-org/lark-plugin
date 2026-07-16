@@ -58,10 +58,10 @@ test("getSkillAuthCacheKey isolates same skill path by account", () => {
 
 test("resolveSkillReadTarget recognizes direct OpenClaw skill reads without workspaceDir", () => {
   assert.deepEqual(
-    resolveSkillReadTarget("/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md"),
+    resolveSkillReadTarget("/root/.openclaw/workspace/skills/feishu-auth-user-granted/SKILL.md"),
     {
-      abs: "/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md",
-      skillName: "feishu-auth-basic",
+      abs: "/root/.openclaw/workspace/skills/feishu-auth-user-granted/SKILL.md",
+      skillName: "feishu-auth-user-granted",
     },
   );
 });
@@ -97,7 +97,7 @@ test("sendAuthCard prefers plugin feishu message tool when available", async () 
   });
 
   const result = await sendAuthCard({
-    skillName: "feishu-auth-basic",
+    skillName: "feishu-auth-user-granted",
     missing: ["contact:user.base:readonly"],
     verificationUrl: "https://example.com/auth",
     userCode: "USERCODE",

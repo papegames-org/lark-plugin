@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createPluginEntry } from "../index.js";
 import { resolveSkillReadTarget } from "../utils.js";
 
-const basicSkillPath = fileURLToPath(new URL("./fixtures/skills/feishu-auth-basic/SKILL.md", import.meta.url));
+const basicSkillPath = fileURLToPath(new URL("./fixtures/skills/feishu-auth-user-granted/SKILL.md", import.meta.url));
 
 test("before_tool_call sends auth card for direct OpenClaw test skill reads", async () => {
   const handlers = new Map();
@@ -138,7 +138,7 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
 
   assert.deepEqual(captured.sendAuthCard, [
     {
-      skillName: "feishu-auth-basic",
+      skillName: "feishu-auth-user-granted",
       missing: ["contact:user.base:readonly"],
       verificationUrl: "https://example.com/auth",
       userCode: "USERCODE",
@@ -148,7 +148,7 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
     },
   ]);
   assert.equal(captured.startWaitForAuth.length, 1);
-  assert.equal(captured.startWaitForAuth[0].skillName, "feishu-auth-basic");
+  assert.equal(captured.startWaitForAuth[0].skillName, "feishu-auth-user-granted");
   assert.equal(captured.startWaitForAuth[0].openId, "ou_test_123");
   assert.equal(result?.block, true);
   assert.match(result?.reason || "", /已发送授权卡片/);
@@ -180,7 +180,7 @@ test("before_tool_call can resolve the test skill from ctx.skillCommand when rea
       return [];
     },
     buildSkillMap() {
-      return new Map([[basicSkillPath, "feishu-auth-basic"]]);
+      return new Map([[basicSkillPath, "feishu-auth-user-granted"]]);
     },
     cachedAccountBySession: new Map(),
     cachedWorkspaceBySession: new Map(),
@@ -247,13 +247,13 @@ test("before_tool_call can resolve the test skill from ctx.skillCommand when rea
       sessionKey: "session-key-a",
       accountId: "acc-a",
       skillCommand: {
-        skillName: "feishu-auth-basic",
+        skillName: "feishu-auth-user-granted",
       },
     },
   );
 
   assert.equal(captured.sendAuthCard.length, 1);
-  assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-basic");
+  assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-user-granted");
   assert.equal(captured.sendAuthCard[0].openId, "ou_skill_command_123");
   assert.equal(result?.block, true);
 });
@@ -390,7 +390,7 @@ test("before_tool_call can authorize skill runtime invocations without a read to
       return [];
     },
     buildSkillMap() {
-      return new Map([[basicSkillPath, "feishu-auth-basic"]]);
+      return new Map([[basicSkillPath, "feishu-auth-user-granted"]]);
     },
     cachedAccountBySession: new Map(),
     cachedWorkspaceBySession: new Map(),
@@ -461,14 +461,14 @@ test("before_tool_call can authorize skill runtime invocations without a read to
       accountId: "acc-a",
       trace: {
         skillCommand: {
-          skillName: "feishu-auth-basic",
+          skillName: "feishu-auth-user-granted",
         },
       },
     },
   );
 
   assert.equal(captured.sendAuthCard.length, 1);
-  assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-basic");
+  assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-user-granted");
   assert.equal(captured.sendAuthCard[0].openId, "ou_trace_skill_command_123");
   assert.equal(captured.sendAuthCard[0].accountId, "acc-a");
   assert.equal(captured.startWaitForAuth.length, 1);
