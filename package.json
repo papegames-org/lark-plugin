@@ -1,10 +1,14 @@
 {
-  "name": "openclaw-skill-runtime",
+  "name": "@jianguo_paper/openclaw-skill-runtime",
   "version": "2.0.0",
   "description": "OpenClaw plugin that pre-authorizes Feishu scopes declared by SKILL.md before skill use.",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "openclaw-skill-runtime": "bin/openclaw-skill-runtime.js"
+  },
   "files": [
+    "bin",
     "docs",
     "feishu-runtime.js",
     "index.js",
@@ -16,7 +20,13 @@
     "AGENTS.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "check:version": "node ./scripts/check-version.js",
+    "check:public": "node ./scripts/check-public.js",
+    "pack:dry": "node ./scripts/run-npm-pack.js --dry-run",
+    "pack:local": "node ./scripts/run-npm-pack.js",
+    "release:check": "npm run check:version && npm run test && npm run check:public && npm run pack:dry",
+    "release:publish": "node ./scripts/publish-npm.js"
   },
   "engines": {
     "node": ">=18.18"

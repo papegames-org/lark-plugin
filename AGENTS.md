@@ -142,6 +142,28 @@ const blockRead = cfg.blockRead !== false;
 - `exhausted` 只是“自动重试耗尽”，不是永久冻结；用户再次触发 skill 读取时应允许显式重试
 - 涉及运行时上下文时，优先读日志和缓存逻辑，不要只看单个 hook
 
+## 发布与版本
+
+这是一个发布到 npm 的公共工具，后续维护时把“版本一致”和“公开仓库安全”当成默认要求。
+
+- 以下文件版本号应保持一致：
+  - `package.json`
+  - `package-lock.json`
+  - `openclaw.plugin.json`
+- 发布前优先跑 `npm run release:check`
+- `release:check` 现在会串行执行：
+  - `npm run check:version`
+  - `npm run test`
+  - `npm run check:public`
+  - `npm run pack:dry`
+- `check:public` 主要拦截：
+  - 常见 token / private key
+  - 明显像真实 secret 的内联赋值
+  - `.npmrc` / `.env` / `.pem` / `.key` 这类高风险文件
+  - 机器绝对路径、真实邮箱等 PII
+
+如果后续改发布脚本、增删打包文件或引入新的演示目录，记得把这几层检查一起更新。
+
 ## 外部参考
 
 - 卡片参考链接：[baileyh8/hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card)
