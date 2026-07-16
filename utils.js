@@ -1,11 +1,11 @@
-// utils.js — Lark Scope Pre-Auth 工具函数集
+// utils.js — OpenClaw Skill Runtime 工具函数集
 // 包含：日志、workspace 查找、skill-map 构建、auth 操作等（frontmatter 解析已移至 parse-meta.js）
 // ============================================================
 
-import { execFile } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { beginScopeGrantFlow, callFeishuOpenApi, resolveFeishuBrand } from "./feishu-runtime.js";
 
 // ---------- 模块级状态（与 index.js register 共享）----------
 
@@ -13,19 +13,38 @@ import { basename, dirname, join, resolve } from "node:path";
 export const cachedWorkspaceBySession = new Map();
 /** account 缓存（按 sessionId/sessionKey） */
 export const cachedAccountBySession = new Map();
+/** sender/openId 缓存（按 sessionId/sessionKey） */
+export const cachedSenderBySession = new Map();
 /** register 时拿到的 api.config 引用（权威来源，免读文件）
  *  导出为 let 绑定，index.js 通过 setApiConfigRef() 写入 */
 export let apiConfigRef = null;
+let runtimeHealthCache = null;
+let pluginApiRef = null;
+const APP_SCOPES_CACHE_TTL_MS = 15000;
+const appScopesCache = new Map();
+const LARK_AUTH_CARD_ICON = {
+  tag: "custom_icon",
+  img_key: "img_v3_0013l_5b29ba19-9327-4eed-b5b9-3cd7f940494g",
+};
 
 /** 设置 api.config 引用（仅内部使用，由 register 在 index.js 调用） */
 export function setApiConfigRef(val) {
   apiConfigRef = val;
 }
 
+export function setPluginApiRef(val) {
+  pluginApiRef = val || null;
+}
+
+export function resetRuntimeCaches() {
+  runtimeHealthCache = null;
+  appScopesCache.clear();
+}
+
 // ---------- 日志 ----------
 
 export function fileLog(msg) {
-  console.log(`[lark-scope-preauth] ${new Date().toISOString()} ${msg}`);
+  console.log(`[openclaw-skill-runtime] ${new Date().toISOString()} ${msg}`);
 }
 
 export function logCtxSnapshotOnce(ctx) {
@@ -77,12 +96,69 @@ export function resolveWorkspaceDir(ctx) {
   return null;
 }
 
+function getOpenClawHomeDir() {
+  const candidates = [
+    process.env.OPENCLAW_HOME,
+    join(homedir(), ".openclaw"),
+  ].filter((value) => typeof value === "string" && value.trim());
+  return candidates.length ? expandHome(candidates[0]) : null;
+}
+
 export function getDefaultSkillRoots(ctx) {
   const ws = resolveWorkspaceDir(ctx);
-  return [
+  const roots = [
     join(homedir(), ".agents", "skills"),
-    join(ws, "skills"),
   ];
+  if (ws) roots.push(join(ws, "skills"));
+  const openclawHome = getOpenClawHomeDir();
+  if (openclawHome) roots.push(join(openclawHome, "workspace", "skills"));
+  return [...new Set(roots.map((root) => resolve(expandHome(root))))];
+}
+
+export function resolveSkillReadTarget(rawPath, cwd, wsDir) {
+  const abs = resolvePath(rawPath, cwd, wsDir);
+  if (!abs || basename(abs) !== "SKILL.md") return null;
+  const normalized = abs.replace(/\\/g, "/");
+  if (!normalized.includes("/skills/")) return null;
+  return {
+    abs,
+    skillName: basename(dirname(abs)),
+  };
+}
+
+export function inferSenderIdFromCtx(ctx) {
+  const candidates = [
+    ctx?.senderId,
+    ctx?.senderOpenId,
+    ctx?.openId,
+    ctx?.channelId,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && /^ou_[A-Za-z0-9]/.test(value.trim())) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+export function cacheSenderId(ctx, senderId) {
+  if (!senderId) return;
+  if (ctx?.sessionId) cachedSenderBySession.set(ctx.sessionId, senderId);
+  if (ctx?.sessionKey) cachedSenderBySession.set(ctx.sessionKey, senderId);
+}
+
+export function getCachedSenderId(ctx) {
+  const direct = inferSenderIdFromCtx(ctx);
+  if (direct) {
+    return direct;
+  }
+  if (ctx?.sessionId && cachedSenderBySession.has(ctx.sessionId)) {
+    return cachedSenderBySession.get(ctx.sessionId);
+  }
+  if (ctx?.sessionKey && cachedSenderBySession.has(ctx.sessionKey)) {
+    return cachedSenderBySession.get(ctx.sessionKey);
+  }
+  return null;
 }
 
 export function expandHome(p) {
@@ -132,18 +208,17 @@ export function buildSkillMap(roots) {
   return map;
 }
 
-// ---------- auth：lark-cli 幂等检查 + no-wait 授权 ----------
-
-const LARK_CLI = "lark-cli";
-
-export function run(args, timeoutMs = 20000) {
-  return new Promise((res) => {
-    execFile(LARK_CLI, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
-      res({ code: err?.code ?? 0, stdout: stdout || "", stderr: stderr || "",
-            error: err && typeof err.code !== "number" ? err : null });
-    });
-  });
+export function buildSkillRootsCacheKey(roots) {
+  if (!Array.isArray(roots) || roots.length === 0) return "<empty>";
+  return roots
+    .map((root) => expandHome(root))
+    .filter(Boolean)
+    .map((root) => resolve(root))
+    .sort()
+    .join("::");
 }
+
+// ---------- auth：Feishu SDK + app registration 授权 ----------
 
 export function parseJsonLoose(text) {
   if (!text) return null;
@@ -153,60 +228,172 @@ export function parseJsonLoose(text) {
   return null;
 }
 
+function formatError(error) {
+  if (!error) return "unknown error";
+  const parts = [];
+  if (error?.name) parts.push(`name=${error.name}`);
+  if (error?.message) parts.push(`message=${error.message}`);
+  if (error?.cause) {
+    if (typeof error.cause === "object") {
+      const causeMessage = error.cause?.message || error.cause?.code || JSON.stringify(error.cause);
+      parts.push(`cause=${causeMessage}`);
+    } else {
+      parts.push(`cause=${String(error.cause)}`);
+    }
+  }
+  if (parts.length === 0) return String(error);
+  return parts.join(" ");
+}
+
+function normalizeAccountId(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "unknown") return null;
+  return trimmed;
+}
+
 export function getAccountId(ctx) {
-  const direct = ctx?.accountId || ctx?.account || ctx?.channelAccountId || null;
+  const direct = normalizeAccountId(ctx?.accountId) || normalizeAccountId(ctx?.account) || normalizeAccountId(ctx?.channelAccountId) || null;
   if (direct) return direct;
   if (ctx?.sessionId && cachedAccountBySession.has(ctx.sessionId)) {
-    return cachedAccountBySession.get(ctx.sessionId);
+    return normalizeAccountId(cachedAccountBySession.get(ctx.sessionId));
   }
   if (ctx?.sessionKey && cachedAccountBySession.has(ctx.sessionKey)) {
-    return cachedAccountBySession.get(ctx.sessionKey);
+    return normalizeAccountId(cachedAccountBySession.get(ctx.sessionKey));
   }
   fileLog(`getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} cacheSize=${cachedAccountBySession.size}`);
   return null;
 }
 
-export async function getAppId(ctx) {
+function getProfileField(profile, candidates) {
+  for (const key of candidates) {
+    const value = profile?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+export function selectAuthedUserProfile(profiles, options = {}) {
+  if (!Array.isArray(profiles) || profiles.length === 0) return null;
+  const accountId = options.accountId || null;
+  const appId = options.appId || null;
+  const normalized = profiles.map((profile) => ({
+    profile,
+    openId: getProfileField(profile, ["userOpenId", "user_open_id", "openId", "open_id"]),
+    accountId: getProfileField(profile, ["accountId", "account_id", "profileId", "profile_id", "id"]),
+    appId: getProfileField(profile, ["appId", "app_id", "clientId", "client_id"]),
+  }));
+
+  if (appId) {
+    const byAppId = normalized.find((entry) => entry.openId && entry.appId === appId);
+    if (byAppId) return byAppId;
+  }
+  if (accountId) {
+    const byAccountId = normalized.find((entry) => entry.openId && entry.accountId === accountId);
+    if (byAccountId) return byAccountId;
+  }
+  return normalized.find((entry) => entry.openId) || null;
+}
+
+export function getSkillAuthCacheKey(skillPath, ctx) {
+  return `${getAccountId(ctx) || "unknown"}::${resolve(skillPath)}`;
+}
+
+export async function getAccountCredentials(ctx) {
   const cfg = apiConfigRef;
-  const cfgSource = "api.config";
   if (!cfg) {
-    throw new Error(`appId unresolved: api.config unavailable (apiConfigRef null)`);
+    throw new Error("feishu account unresolved: api.config unavailable");
   }
-  const accounts = cfg?.channels?.feishu?.accounts || null;
-  if (!accounts || typeof accounts !== "object") {
-    throw new Error(`appId unresolved: channels.feishu.accounts missing in api.config`);
+  const feishuCfg = cfg?.channels?.feishu || null;
+  if (!feishuCfg || typeof feishuCfg !== "object") {
+    throw new Error("feishu account unresolved: channels.feishu missing in api.config");
   }
-  const accountId = getAccountId(ctx);
-  if (accountId && accounts[accountId]?.appId) {
-    const appId = accounts[accountId].appId;
-    // fileLog(`getAppId: from ${cfgSource} accounts[${accountId}].appId=${appId}`);
-    return appId;
+
+  const accounts = feishuCfg.accounts && typeof feishuCfg.accounts === "object"
+    ? feishuCfg.accounts
+    : {};
+  const requestedAccountId = getAccountId(ctx);
+  const accountIds = Object.keys(accounts);
+
+  let resolvedAccountId = requestedAccountId;
+  let merged = {
+    ...feishuCfg,
+  };
+
+  if (requestedAccountId && accounts[requestedAccountId]) {
+    merged = { ...feishuCfg, ...accounts[requestedAccountId] };
+  } else if (!requestedAccountId && accountIds.length === 1) {
+    resolvedAccountId = accountIds[0];
+    merged = { ...feishuCfg, ...accounts[resolvedAccountId] };
+  } else if (!requestedAccountId && feishuCfg.appId && feishuCfg.appSecret) {
+    resolvedAccountId = "default";
+  } else if (requestedAccountId) {
+    throw new Error(`feishu account unresolved: accountId=${requestedAccountId} not found among [${accountIds.join(", ")}]`);
   }
-  const keys = Object.keys(accounts);
-  if (!accountId && keys.length === 1 && accounts[keys[0]]?.appId) {
-    const appId = accounts[keys[0]].appId;
-    // fileLog(`getAppId: single-account fallback (${cfgSource}) accounts[${keys[0]}].appId=${appId}`);
-    return appId;
+
+  if (!merged.appId || !merged.appSecret) {
+    throw new Error(`feishu account unresolved: missing appId/appSecret for ${resolvedAccountId || "default"}`);
   }
-  throw new Error(`appId unresolved: accountId=${accountId || "<empty>"} not found among [${keys.join(", ")}]`);
+
+  return {
+    accountId: resolvedAccountId || "default",
+    appId: String(merged.appId),
+    appSecret: String(merged.appSecret),
+    brand: resolveFeishuBrand(merged.domain),
+    domain: merged.domain ? String(merged.domain) : null,
+  };
+}
+
+export async function getAppId(ctx) {
+  const credentials = await getAccountCredentials(ctx);
+  return credentials.appId;
 }
 
 export async function getAppScopes(ctx) {
-  const aid = await getAppId(ctx);
-  fileLog(`getAppScopes: resolved appId=${aid || "<empty>"}`);
-  if (!aid) return null;
-  const { stdout } = await run(["api", "GET",
-    `/open-apis/application/v6/applications/${aid}`,
-    "--as", "bot", "--params", '{"lang":"zh_cn"}'
-  ], 15000);
-  const j = parseJsonLoose(stdout);
-  if (!j || j.code !== 0) {
-    fileLog(`getAppScopes: API failed: ${j?.msg || j?.error?.message || "unparseable"}`);
-    return null;
+  const credentials = await getAccountCredentials(ctx);
+  const aid = credentials.appId;
+  fileLog(`getAppScopes: resolved appId=${aid || "<empty>"} accountId=${credentials.accountId}`);
+  const cached = appScopesCache.get(aid);
+  const now = Date.now();
+  if (cached?.scopes && cached.expiresAt > now) {
+    return cached.scopes;
   }
-  const scopesArr = j?.data?.app?.scopes;
-  if (!Array.isArray(scopesArr)) return null;
-  return scopesArr.map((s) => s.scope);
+  if (cached?.promise) {
+    return cached.promise;
+  }
+
+  const combinedPromise = callFeishuOpenApi(credentials, {
+    method: "GET",
+    path: `/open-apis/application/v6/applications/${aid}`,
+    params: { lang: "zh_cn" },
+  }).then((response) => {
+    if (!response || response.code !== 0) {
+      fileLog(`getAppScopes: API failed: ${response?.msg || response?.message || "unparseable"}`);
+      return null;
+    }
+    const scopesArr = response?.data?.app?.scopes;
+    if (!Array.isArray(scopesArr)) {
+      return null;
+    }
+    const scopes = [...new Set(scopesArr.map((item) => item?.scope).filter(Boolean))];
+    if (!scopes) {
+      appScopesCache.delete(aid);
+      return null;
+    }
+    appScopesCache.set(aid, {
+      scopes,
+      expiresAt: Date.now() + APP_SCOPES_CACHE_TTL_MS,
+      promise: null,
+    });
+    return scopes;
+  }).catch((error) => {
+    fileLog(`getAppScopes: request failed: ${formatError(error)}`);
+    appScopesCache.delete(aid);
+    return null;
+  });
+
+  appScopesCache.set(aid, { scopes: null, expiresAt: 0, promise: combinedPromise });
+  return combinedPromise;
 }
 
 export async function checkScopes(scopes, ctx) {
@@ -216,41 +403,66 @@ export async function checkScopes(scopes, ctx) {
     fileLog(`checkScopes: getAppScopes failed, falling back to all missing`);
     return { ok: false, missing: scopes, granted: [] };
   }
-  const missing = scopes.filter((s) => !appScopes.includes(s));
-  const granted = scopes.filter((s) => appScopes.includes(s));
+  const appScopesSet = new Set(appScopes);
+  const missing = scopes.filter((s) => !appScopesSet.has(s));
+  const granted = scopes.filter((s) => appScopesSet.has(s));
   fileLog(`checkScopes: appScopes=${appScopes.length}, missing=${JSON.stringify(missing)}, granted=${JSON.stringify(granted)}`);
   return { ok: missing.length === 0, missing, granted };
 }
 
-export async function startLogin(missing) {
+export async function startLogin(missing, ctx) {
   if (!missing?.length) return { error: "no scopes" };
-  const { stdout, stderr, error } = await run(
-    ["auth", "login", "--no-wait", "--json", "--scope", missing.join(" ")], 30000);
-  if (error) return { error: String(error.message || error) };
-  const j = parseJsonLoose(stdout);
-  if (!j) return { error: `unparseable: ${(stdout || stderr).slice(0, 200)}` };
-  const vUrl = j.verification_uri_complete || j.verificationUriComplete ||
-      j.verification_uri || j.verificationUri || j.verification_url || j.url;
-  let uCode = j.user_code || j.userCode;
-  if (!uCode && vUrl) {
-    const m = String(vUrl).match(/[?&]user_code=([^&]+)/);
-    if (m) uCode = decodeURIComponent(m[1]);
+  try {
+    const credentials = await getAccountCredentials(ctx);
+    return await beginScopeGrantFlow({
+      appId: credentials.appId,
+      brand: credentials.brand,
+      scopes: missing,
+    });
+  } catch (error) {
+    fileLog(`startLogin: request failed: ${formatError(error)}`);
+    return { error: String(error?.message || error) };
   }
-  return {
-    verificationUrl: vUrl,
-    userCode: uCode,
-    deviceCode: j.device_code || j.deviceCode,
-    expiresIn: j.expires_in || j.expiresIn,
-  };
 }
 
-export async function getAuthedUser() {
-  const { stdout } = await run(["auth", "list"], 10000);
-  const j = parseJsonLoose(stdout);
-  const arr = Array.isArray(j) ? j : (Array.isArray(j?.profiles) ? j.profiles : null);
-  if (!arr || !arr.length) return null;
-  const p = arr[0];
-  return { openId: p.userOpenId || p.user_open_id || p.openId };
+export async function getAuthedUser(ctx) {
+  const openId = getCachedSenderId(ctx) || null;
+  return openId ? { openId } : null;
+}
+
+export async function ensureFeishuRuntimeHealth() {
+  if (runtimeHealthCache) return runtimeHealthCache;
+  runtimeHealthCache = getAccountCredentials({})
+    .then((credentials) => {
+      const info = {
+        ok: true,
+        source: "config",
+        command: "feishu-sdk",
+        version: "node-sdk",
+        recommendedVersion: "node-sdk",
+        matchesRecommended: true,
+        recoveryHint: null,
+        accountId: credentials.accountId,
+        appId: credentials.appId,
+      };
+      fileLog(`runtime: feishu sdk ready accountId=${credentials.accountId} appId=${credentials.appId}`);
+      return info;
+    })
+    .catch((error) => {
+      const info = {
+        ok: false,
+        source: "config",
+        command: "feishu-sdk",
+        version: null,
+        recommendedVersion: "node-sdk",
+        matchesRecommended: false,
+        error: error?.message || String(error),
+        recoveryHint: "请在 api.config.channels.feishu 或 channels.feishu.accounts 中配置可用的 appId/appSecret。",
+      };
+      fileLog(`runtime: feishu sdk unavailable error=${info.error}`);
+      return info;
+    });
+  return runtimeHealthCache;
 }
 
 export function sidebarApplink(authUrl) {
@@ -261,14 +473,74 @@ export function sidebarApplink(authUrl) {
 /** 按 skillName 去重的轮询定时器，防止同一技能创建多个轮询 */
 const activePollingIntervals = new Map();
 
-export function startWaitForAuth({ skillName, deviceCode, missingKey, openId, scopes, ctx }) {
+async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
+  if (!openId) return { error: "no openId" };
+  if (pluginApiRef?.tools?.feishu_im_user_message) {
+    fileLog(`sendInteractiveCard: using plugin tool for openId=${openId}`);
+    try {
+      const response = await pluginApiRef.tools.feishu_im_user_message({
+        action: "send",
+        receive_id: openId,
+        receive_id_type: "open_id",
+        msg_type: "interactive",
+        content: JSON.stringify(card),
+      });
+      return {
+        messageId: response?.data?.message_id || response?.message_id || response?.id || (response?.success ? "sent" : null),
+      };
+    } catch (error) {
+      fileLog(`sendInteractiveCard: plugin tool failed: ${formatError(error)}`);
+    }
+  } else {
+    fileLog(`sendInteractiveCard: plugin tool unavailable, falling back to HTTP openId=${openId}`);
+  }
+  const credentials = await getAccountCredentials(ctx);
+  try {
+    fileLog(`sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} openId=${openId}`);
+    const response = await callFeishuOpenApi(credentials, {
+      method: "POST",
+      path: "/open-apis/im/v1/messages",
+      params: { receive_id_type: "open_id" },
+      body: {
+        receive_id: openId,
+        msg_type: "interactive",
+        content: JSON.stringify(card),
+      },
+    });
+    return { messageId: response?.data?.message_id || null };
+  } catch (error) {
+    return { error: formatError(error) };
+  }
+}
+
+async function sendAuthSuccessCard({ skillName, openId, accountId }) {
+  const doneCard = {
+    schema: "2.0",
+    config: { wide_screen_mode: true, width_mode: "compact" },
+    header: {
+      template: "green",
+      title: { tag: "plain_text", content: "授权完成" },
+      subtitle: { tag: "plain_text", content: `技能 “${skillName}” 已可使用` },
+      icon: { ...LARK_AUTH_CARD_ICON },
+    },
+    body: {
+      elements: [
+        { tag: "markdown", content: `技能 **${skillName}** 的飞书权限已授权成功！现在可以正常使用啦 🦐` },
+      ],
+    },
+  };
+  return sendInteractiveCard(openId, doneCard, 10000, { accountId });
+}
+
+export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missingKey, openId, scopes, ctx }) {
   if (!deviceCode) return;
   // 如果该技能已有轮询在跑，先清理旧的，避免重复
-  const existing = activePollingIntervals.get(skillName);
+  const pollingKey = authTargetKey || skillName;
+  const existing = activePollingIntervals.get(pollingKey);
   if (existing) {
     clearInterval(existing.interval);
     existing.completed = true;
-    fileLog(`waitForAuth: replacing existing poll for "${skillName}"`);
+    fileLog(`waitForAuth: replacing existing poll for "${pollingKey}"`);
   }
 
   fileLog(`waitForAuth: starting for "${skillName}" deviceCode=${deviceCode.slice(0, 12)}...`);
@@ -281,62 +553,53 @@ export function startWaitForAuth({ skillName, deviceCode, missingKey, openId, sc
   let completed = false;
 
   // 注册到全局 map，供后续去重
-  activePollingIntervals.set(skillName, { interval: null, completed: false, get completedRef() { return completed; } });
+  activePollingIntervals.set(pollingKey, { interval: null, completed: false, get completedRef() { return completed; } });
 
   const cleanup = () => {
     if (interval) { clearInterval(interval); interval = null; }
     completed = true;
-    activePollingIntervals.delete(skillName);
+    activePollingIntervals.delete(pollingKey);
   };
 
   const poll = async () => {
     if (completed) return;
-    const elapsed = Date.now() - t0;
-    if (elapsed > MAX_WAIT_MS) {
-      fileLog(`waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`);
-      cleanup();
-      return;
-    }
-
-    const appScopes = await getAppScopes(ctx);
-    if (appScopes) {
-      const allGranted = scopes.every((s) => appScopes.includes(s));
-      if (allGranted) {
-        completed = true;
+    try {
+      const elapsed = Date.now() - t0;
+      if (elapsed > MAX_WAIT_MS) {
+        fileLog(`waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`);
         cleanup();
-        fileLog(`waitForAuth: "${skillName}" authorized! (${Math.round(elapsed / 1000)}s)`);
-        if (openId) {
-          const doneCard = {
-            schema: "2.0",
-            config: { wide_screen_mode: true, width_mode: "compact" },
-            header: {
-              template: "green",
-              title: { tag: "plain_text", content: "授权完成" },
-              subtitle: { tag: "plain_text", content: `技能 “${skillName}” 已可使用` },
-              icon: { tag: "standard_icon", token: "check_outlined" },
-            },
-            body: {
-              elements: [
-                { tag: "markdown", content: `技能 **${skillName}** 的飞书权限已授权成功！现在可以正常使用啦 🦐` },
-              ],
-            },
-          };
-          execFile("lark-cli", ["im", "+messages-send", "--as", "bot", "--msg-type", "interactive",
-            "--user-id", openId, "--content", JSON.stringify(doneCard)], { timeout: 10000 }, () => {});
-        }
         return;
       }
+
+      const appScopes = await getAppScopes(ctx);
+      if (appScopes) {
+        const appScopesSet = new Set(appScopes);
+        const allGranted = scopes.every((s) => appScopesSet.has(s));
+        if (allGranted) {
+          cleanup();
+          fileLog(`waitForAuth: "${skillName}" authorized! (${Math.round(elapsed / 1000)}s)`);
+          if (openId) {
+            const sent = await sendAuthSuccessCard({ skillName, openId, accountId: ctx?.accountId || ctx?.account });
+            if (!sent?.messageId && sent?.error) {
+              fileLog(`waitForAuth: auth success card failed for "${skillName}": ${sent.error}`);
+            }
+          }
+          return;
+        }
+      }
+    } catch (error) {
+      fileLog(`waitForAuth: poll failed for "${skillName}": ${error?.message || error}`);
     }
   };
 
   interval = setInterval(poll, POLL_MS);
   // 更新全局 map 中的 interval 引用（创建时 interval 为 null，需要回填）
-  const entry = activePollingIntervals.get(skillName);
+  const entry = activePollingIntervals.get(pollingKey);
   if (entry) entry.interval = interval;
   poll();
 }
 
-export async function sendAuthCard({ skillName, missing, verificationUrl, userCode, openId, appId }) {
+export async function sendAuthCard({ skillName, missing, verificationUrl, userCode, openId, accountId }) {
   if (!openId) return { error: "no openId" };
   // 用 sidebar-semi applink 包裹，在飞书内以侧边栏打开，不跳转系统浏览器
   const authUrl = sidebarApplink(verificationUrl);
@@ -350,7 +613,7 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
       template: "orange",
       title: { tag: "plain_text", content: "飞书权限授权提醒" },
       subtitle: { tag: "plain_text", content: `技能 “${skillName}” 需要你确认` },
-      icon: { tag: "standard_icon", token: "safe_outlined" },
+      icon: { ...LARK_AUTH_CARD_ICON },
     },
     body: {
       elements: [
@@ -388,11 +651,5 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
       ],
     },
   };
-  const args = ["im", "+messages-send", "--as", "bot", "--msg-type", "interactive",
-    "--user-id", openId, "--content", JSON.stringify(card)];
-  const { stdout, stderr, error } = await run(args, 20000);
-  if (error) return { error: String(error.message || error) };
-  const j = parseJsonLoose(stdout);
-  if (j?.ok === false) return { error: j?.error?.message || "send failed" };
-  return { messageId: j?.data?.message_id };
+  return sendInteractiveCard(openId, card, 20000, { accountId });
 }
