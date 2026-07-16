@@ -1,11 +1,12 @@
 ---
 name: feishu-auth-retry
 description: Fixture skill for validating pending notice persistence and retry behavior.
-larkAuth:
-  identity: user
-  scopes:
-    - im:message
-    - contact:user.base:readonly
+metadata:
+  openclaw:
+    larkAuth:
+      identity: user
+      scopes:
+        - "acs:access_record:readonly"
 ---
 
 # Feishu Auth Retry
@@ -14,8 +15,8 @@ This fixture is intended for failure-path validation.
 
 Use it when you want to verify that:
 
-- the YAML `larkAuth` format is parsed correctly
-- missing scopes are detected for more than one scope at once
+- the nested YAML `metadata.openclaw.larkAuth` format is parsed correctly
+- missing mail scopes are detected for more than one scope at once
 - auth-card send failures enter the pending notice queue
 - retries survive restart and can be resumed on the next read
 
