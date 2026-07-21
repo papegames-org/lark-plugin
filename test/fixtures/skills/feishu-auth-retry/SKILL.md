@@ -6,6 +6,8 @@ metadata:
     larkAuth:
       identity: user
       scopes:
+        - "contact:contact"
+        - "base:block:create"
         - "acs:access_record:readonly"
 ---
 

@@ -5,7 +5,11 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { beginScopeGrantFlow, callFeishuOpenApi, resolveFeishuBrand } from "./feishu-runtime.js";
+import {
+  beginScopeGrantFlow,
+  callFeishuOpenApi,
+  resolveFeishuBrand,
+} from "./feishu-runtime.js";
 
 // ---------- 模块级状态（与 index.js register 共享）----------
 
@@ -22,10 +26,15 @@ let runtimeHealthCache = null;
 let pluginApiRef = null;
 const APP_SCOPES_CACHE_TTL_MS = 15000;
 const appScopesCache = new Map();
-const LARK_AUTH_CARD_ICON = {
-  tag: "custom_icon",
-  img_key: "img_v3_0013l_5b29ba19-9327-4eed-b5b9-3cd7f940494g",
-};
+const LARK_AUTH_CARD_FOOTER_IMAGE_KEY =
+  "img_v3_0013l_5b29ba19-9327-4eed-b5b9-3cd7f940494g";
+const LARK_AUTH_CARD_HEADER_TAGS = [
+  {
+    tag: "text_tag",
+    text: { tag: "plain_text", content: "Paper" },
+    color: "red",
+  },
+];
 
 /** 设置 api.config 引用（仅内部使用，由 register 在 index.js 调用） */
 export function setApiConfigRef(val) {
@@ -50,22 +59,28 @@ export function fileLog(msg) {
 export function logCtxSnapshotOnce(ctx) {
   if (!ctx || ctx.__larkScopeCtxLogged) return;
   try {
-    Object.defineProperty(ctx, "__larkScopeCtxLogged", { value: true, enumerable: false, configurable: true });
+    Object.defineProperty(ctx, "__larkScopeCtxLogged", {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
   } catch {
     ctx.__larkScopeCtxLogged = true;
   }
-  fileLog(`ctx snapshot=${JSON.stringify({
-    accountId: ctx?.accountId,
-    account: ctx?.account,
-    senderId: ctx?.senderId,
-    messageId: ctx?.messageId,
-    sessionKey: ctx?.sessionKey,
-    sessionId: ctx?.sessionId,
-    agentId: ctx?.agentId,
-    workspaceDir: ctx?.workspaceDir || null,
-    channelId: ctx?.channelId,
-    __allKeys: ctx ? Object.keys(ctx) : null,
-  })}`);
+  fileLog(
+    `ctx snapshot=${JSON.stringify({
+      accountId: ctx?.accountId,
+      account: ctx?.account,
+      senderId: ctx?.senderId,
+      messageId: ctx?.messageId,
+      sessionKey: ctx?.sessionKey,
+      sessionId: ctx?.sessionId,
+      agentId: ctx?.agentId,
+      workspaceDir: ctx?.workspaceDir || null,
+      channelId: ctx?.channelId,
+      __allKeys: ctx ? Object.keys(ctx) : null,
+    })}`,
+  );
 }
 
 // ---------- workspace 查找：只用 api.config（不读文件）----------
@@ -92,7 +107,9 @@ export function resolveWorkspaceDir(ctx) {
     fileLog(`workspace: from cache (sessionId=${ctx.sessionId}) -> ${cached}`);
     return cached;
   }
-  fileLog(`workspace: no ctx.workspaceDir and no cache for agentId=${ctx?.agentId || "<empty>"} — returning null`);
+  fileLog(
+    `workspace: no ctx.workspaceDir and no cache for agentId=${ctx?.agentId || "<empty>"} — returning null`,
+  );
   return null;
 }
 
@@ -106,9 +123,7 @@ function getOpenClawHomeDir() {
 
 export function getDefaultSkillRoots(ctx) {
   const ws = resolveWorkspaceDir(ctx);
-  const roots = [
-    join(homedir(), ".agents", "skills"),
-  ];
+  const roots = [join(homedir(), ".agents", "skills")];
   if (ws) roots.push(join(ws, "skills"));
   const openclawHome = getOpenClawHomeDir();
   if (openclawHome) roots.push(join(openclawHome, "workspace", "skills"));
@@ -222,10 +237,41 @@ export function buildSkillRootsCacheKey(roots) {
 
 export function parseJsonLoose(text) {
   if (!text) return null;
-  try { return JSON.parse(text); } catch {}
-  const s = text.indexOf("{"), e = text.lastIndexOf("}");
-  if (s !== -1 && e > s) { try { return JSON.parse(text.slice(s, e + 1)); } catch {} }
+  try {
+    return JSON.parse(text);
+  } catch {}
+  const s = text.indexOf("{"),
+    e = text.lastIndexOf("}");
+  if (s !== -1 && e > s) {
+    try {
+      return JSON.parse(text.slice(s, e + 1));
+    } catch {}
+  }
   return null;
+}
+
+function formatFeishuApiResponseError(response) {
+  if (!response) return "empty response";
+  const code =
+    response?.code ?? response?.error?.code ?? response?.status_code ?? null;
+  const message =
+    response?.msg ||
+    response?.message ||
+    response?.error?.message ||
+    response?.error_description ||
+    null;
+  const requestId =
+    response?.request_id || response?.RequestId || response?.requestId || null;
+  const details = [];
+  if (code !== null && code !== undefined) details.push(`code=${code}`);
+  if (message) details.push(`msg=${message}`);
+  if (requestId) details.push(`request_id=${requestId}`);
+  if (details.length) return details.join(" ");
+  try {
+    return JSON.stringify(response);
+  } catch {
+    return String(response);
+  }
 }
 
 function formatError(error) {
@@ -235,7 +281,10 @@ function formatError(error) {
   if (error?.message) parts.push(`message=${error.message}`);
   if (error?.cause) {
     if (typeof error.cause === "object") {
-      const causeMessage = error.cause?.message || error.cause?.code || JSON.stringify(error.cause);
+      const causeMessage =
+        error.cause?.message ||
+        error.cause?.code ||
+        JSON.stringify(error.cause);
       parts.push(`cause=${causeMessage}`);
     } else {
       parts.push(`cause=${String(error.cause)}`);
@@ -253,7 +302,11 @@ function normalizeAccountId(value) {
 }
 
 export function getAccountId(ctx) {
-  const direct = normalizeAccountId(ctx?.accountId) || normalizeAccountId(ctx?.account) || normalizeAccountId(ctx?.channelAccountId) || null;
+  const direct =
+    normalizeAccountId(ctx?.accountId) ||
+    normalizeAccountId(ctx?.account) ||
+    normalizeAccountId(ctx?.channelAccountId) ||
+    null;
   if (direct) return direct;
   if (ctx?.sessionId && cachedAccountBySession.has(ctx.sessionId)) {
     return normalizeAccountId(cachedAccountBySession.get(ctx.sessionId));
@@ -261,7 +314,9 @@ export function getAccountId(ctx) {
   if (ctx?.sessionKey && cachedAccountBySession.has(ctx.sessionKey)) {
     return normalizeAccountId(cachedAccountBySession.get(ctx.sessionKey));
   }
-  fileLog(`getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} cacheSize=${cachedAccountBySession.size}`);
+  fileLog(
+    `getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} cacheSize=${cachedAccountBySession.size}`,
+  );
   return null;
 }
 
@@ -279,17 +334,37 @@ export function selectAuthedUserProfile(profiles, options = {}) {
   const appId = options.appId || null;
   const normalized = profiles.map((profile) => ({
     profile,
-    openId: getProfileField(profile, ["userOpenId", "user_open_id", "openId", "open_id"]),
-    accountId: getProfileField(profile, ["accountId", "account_id", "profileId", "profile_id", "id"]),
-    appId: getProfileField(profile, ["appId", "app_id", "clientId", "client_id"]),
+    openId: getProfileField(profile, [
+      "userOpenId",
+      "user_open_id",
+      "openId",
+      "open_id",
+    ]),
+    accountId: getProfileField(profile, [
+      "accountId",
+      "account_id",
+      "profileId",
+      "profile_id",
+      "id",
+    ]),
+    appId: getProfileField(profile, [
+      "appId",
+      "app_id",
+      "clientId",
+      "client_id",
+    ]),
   }));
 
   if (appId) {
-    const byAppId = normalized.find((entry) => entry.openId && entry.appId === appId);
+    const byAppId = normalized.find(
+      (entry) => entry.openId && entry.appId === appId,
+    );
     if (byAppId) return byAppId;
   }
   if (accountId) {
-    const byAccountId = normalized.find((entry) => entry.openId && entry.accountId === accountId);
+    const byAccountId = normalized.find(
+      (entry) => entry.openId && entry.accountId === accountId,
+    );
     if (byAccountId) return byAccountId;
   }
   return normalized.find((entry) => entry.openId) || null;
@@ -306,12 +381,15 @@ export async function getAccountCredentials(ctx) {
   }
   const feishuCfg = cfg?.channels?.feishu || null;
   if (!feishuCfg || typeof feishuCfg !== "object") {
-    throw new Error("feishu account unresolved: channels.feishu missing in api.config");
+    throw new Error(
+      "feishu account unresolved: channels.feishu missing in api.config",
+    );
   }
 
-  const accounts = feishuCfg.accounts && typeof feishuCfg.accounts === "object"
-    ? feishuCfg.accounts
-    : {};
+  const accounts =
+    feishuCfg.accounts && typeof feishuCfg.accounts === "object"
+      ? feishuCfg.accounts
+      : {};
   const requestedAccountId = getAccountId(ctx);
   const accountIds = Object.keys(accounts);
 
@@ -328,11 +406,15 @@ export async function getAccountCredentials(ctx) {
   } else if (!requestedAccountId && feishuCfg.appId && feishuCfg.appSecret) {
     resolvedAccountId = "default";
   } else if (requestedAccountId) {
-    throw new Error(`feishu account unresolved: accountId=${requestedAccountId} not found among [${accountIds.join(", ")}]`);
+    throw new Error(
+      `feishu account unresolved: accountId=${requestedAccountId} not found among [${accountIds.join(", ")}]`,
+    );
   }
 
   if (!merged.appId || !merged.appSecret) {
-    throw new Error(`feishu account unresolved: missing appId/appSecret for ${resolvedAccountId || "default"}`);
+    throw new Error(
+      `feishu account unresolved: missing appId/appSecret for ${resolvedAccountId || "default"}`,
+    );
   }
 
   return {
@@ -352,7 +434,9 @@ export async function getAppId(ctx) {
 export async function getAppScopes(ctx) {
   const credentials = await getAccountCredentials(ctx);
   const aid = credentials.appId;
-  fileLog(`getAppScopes: resolved appId=${aid || "<empty>"} accountId=${credentials.accountId}`);
+  fileLog(
+    `getAppScopes: resolved appId=${aid || "<empty>"} accountId=${credentials.accountId}`,
+  );
   const cached = appScopesCache.get(aid);
   const now = Date.now();
   if (cached?.scopes && cached.expiresAt > now) {
@@ -366,33 +450,43 @@ export async function getAppScopes(ctx) {
     method: "GET",
     path: `/open-apis/application/v6/applications/${aid}`,
     params: { lang: "zh_cn" },
-  }).then((response) => {
-    if (!response || response.code !== 0) {
-      fileLog(`getAppScopes: API failed: ${response?.msg || response?.message || "unparseable"}`);
-      return null;
-    }
-    const scopesArr = response?.data?.app?.scopes;
-    if (!Array.isArray(scopesArr)) {
-      return null;
-    }
-    const scopes = [...new Set(scopesArr.map((item) => item?.scope).filter(Boolean))];
-    if (!scopes) {
+  })
+    .then((response) => {
+      if (!response || response.code !== 0) {
+        fileLog(
+          `getAppScopes: API failed: ${response?.msg || response?.message || "unparseable"}`,
+        );
+        return null;
+      }
+      const scopesArr = response?.data?.app?.scopes;
+      if (!Array.isArray(scopesArr)) {
+        return null;
+      }
+      const scopes = [
+        ...new Set(scopesArr.map((item) => item?.scope).filter(Boolean)),
+      ];
+      if (!scopes) {
+        appScopesCache.delete(aid);
+        return null;
+      }
+      appScopesCache.set(aid, {
+        scopes,
+        expiresAt: Date.now() + APP_SCOPES_CACHE_TTL_MS,
+        promise: null,
+      });
+      return scopes;
+    })
+    .catch((error) => {
+      fileLog(`getAppScopes: request failed: ${formatError(error)}`);
       appScopesCache.delete(aid);
       return null;
-    }
-    appScopesCache.set(aid, {
-      scopes,
-      expiresAt: Date.now() + APP_SCOPES_CACHE_TTL_MS,
-      promise: null,
     });
-    return scopes;
-  }).catch((error) => {
-    fileLog(`getAppScopes: request failed: ${formatError(error)}`);
-    appScopesCache.delete(aid);
-    return null;
-  });
 
-  appScopesCache.set(aid, { scopes: null, expiresAt: 0, promise: combinedPromise });
+  appScopesCache.set(aid, {
+    scopes: null,
+    expiresAt: 0,
+    promise: combinedPromise,
+  });
   return combinedPromise;
 }
 
@@ -406,7 +500,9 @@ export async function checkScopes(scopes, ctx) {
   const appScopesSet = new Set(appScopes);
   const missing = scopes.filter((s) => !appScopesSet.has(s));
   const granted = scopes.filter((s) => appScopesSet.has(s));
-  fileLog(`checkScopes: appScopes=${appScopes.length}, missing=${JSON.stringify(missing)}, granted=${JSON.stringify(granted)}`);
+  fileLog(
+    `checkScopes: appScopes=${appScopes.length}, missing=${JSON.stringify(missing)}, granted=${JSON.stringify(granted)}`,
+  );
   return { ok: missing.length === 0, missing, granted };
 }
 
@@ -445,7 +541,9 @@ export async function ensureFeishuRuntimeHealth() {
         accountId: credentials.accountId,
         appId: credentials.appId,
       };
-      fileLog(`runtime: feishu sdk ready accountId=${credentials.accountId} appId=${credentials.appId}`);
+      fileLog(
+        `runtime: feishu sdk ready accountId=${credentials.accountId} appId=${credentials.appId}`,
+      );
       return info;
     })
     .catch((error) => {
@@ -457,7 +555,8 @@ export async function ensureFeishuRuntimeHealth() {
         recommendedVersion: "node-sdk",
         matchesRecommended: false,
         error: error?.message || String(error),
-        recoveryHint: "请在 api.config.channels.feishu 或 channels.feishu.accounts 中配置可用的 appId/appSecret。",
+        recoveryHint:
+          "请在 api.config.channels.feishu 或 channels.feishu.accounts 中配置可用的 appId/appSecret。",
       };
       fileLog(`runtime: feishu sdk unavailable error=${info.error}`);
       return info;
@@ -485,18 +584,26 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
         msg_type: "interactive",
         content: JSON.stringify(card),
       });
-      return {
-        messageId: response?.data?.message_id || response?.message_id || response?.id || (response?.success ? "sent" : null),
-      };
+      const messageId =
+        response?.data?.message_id ||
+        response?.message_id ||
+        response?.id ||
+        (response?.success ? "sent" : null);
+      if (messageId) return { messageId };
+      return { error: formatFeishuApiResponseError(response) };
     } catch (error) {
       fileLog(`sendInteractiveCard: plugin tool failed: ${formatError(error)}`);
     }
   } else {
-    fileLog(`sendInteractiveCard: plugin tool unavailable, falling back to HTTP openId=${openId}`);
+    fileLog(
+      `sendInteractiveCard: plugin tool unavailable, falling back to HTTP openId=${openId}`,
+    );
   }
   const credentials = await getAccountCredentials(ctx);
   try {
-    fileLog(`sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} openId=${openId}`);
+    fileLog(
+      `sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} openId=${openId}`,
+    );
     const response = await callFeishuOpenApi(credentials, {
       method: "POST",
       path: "/open-apis/im/v1/messages",
@@ -507,7 +614,9 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
         content: JSON.stringify(card),
       },
     });
-    return { messageId: response?.data?.message_id || null };
+    const messageId = response?.data?.message_id || null;
+    if (messageId) return { messageId };
+    return { error: formatFeishuApiResponseError(response) };
   } catch (error) {
     return { error: formatError(error) };
   }
@@ -521,18 +630,30 @@ async function sendAuthSuccessCard({ skillName, openId, accountId }) {
       template: "green",
       title: { tag: "plain_text", content: "授权完成" },
       subtitle: { tag: "plain_text", content: `技能 “${skillName}” 已可使用` },
-      icon: { ...LARK_AUTH_CARD_ICON },
+      text_tag_list: LARK_AUTH_CARD_HEADER_TAGS,
+      icon: { tag: "standard_icon", token: "check_outlined" },
     },
     body: {
       elements: [
-        { tag: "markdown", content: `技能 **${skillName}** 的飞书权限已授权成功！现在可以正常使用啦 🦐` },
+        {
+          tag: "markdown",
+          content: `技能 **${skillName}** 的飞书权限已授权成功！现在可以正常使用啦 🦐`,
+        },
       ],
     },
   };
   return sendInteractiveCard(openId, doneCard, 10000, { accountId });
 }
 
-export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missingKey, openId, scopes, ctx }) {
+export function startWaitForAuth({
+  authTargetKey,
+  skillName,
+  deviceCode,
+  missingKey,
+  openId,
+  scopes,
+  ctx,
+}) {
   if (!deviceCode) return;
   // 如果该技能已有轮询在跑，先清理旧的，避免重复
   const pollingKey = authTargetKey || skillName;
@@ -543,7 +664,9 @@ export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missing
     fileLog(`waitForAuth: replacing existing poll for "${pollingKey}"`);
   }
 
-  fileLog(`waitForAuth: starting for "${skillName}" deviceCode=${deviceCode.slice(0, 12)}...`);
+  fileLog(
+    `waitForAuth: starting for "${skillName}" deviceCode=${deviceCode.slice(0, 12)}...`,
+  );
   const t0 = Date.now();
   // 轮询间隔 15 秒（用户手动授权通常需要更长时间，无需高频请求）
   const POLL_MS = 15000;
@@ -553,10 +676,19 @@ export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missing
   let completed = false;
 
   // 注册到全局 map，供后续去重
-  activePollingIntervals.set(pollingKey, { interval: null, completed: false, get completedRef() { return completed; } });
+  activePollingIntervals.set(pollingKey, {
+    interval: null,
+    completed: false,
+    get completedRef() {
+      return completed;
+    },
+  });
 
   const cleanup = () => {
-    if (interval) { clearInterval(interval); interval = null; }
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+    }
     completed = true;
     activePollingIntervals.delete(pollingKey);
   };
@@ -566,7 +698,9 @@ export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missing
     try {
       const elapsed = Date.now() - t0;
       if (elapsed > MAX_WAIT_MS) {
-        fileLog(`waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`);
+        fileLog(
+          `waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`,
+        );
         cleanup();
         return;
       }
@@ -577,18 +711,28 @@ export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missing
         const allGranted = scopes.every((s) => appScopesSet.has(s));
         if (allGranted) {
           cleanup();
-          fileLog(`waitForAuth: "${skillName}" authorized! (${Math.round(elapsed / 1000)}s)`);
+          fileLog(
+            `waitForAuth: "${skillName}" authorized! (${Math.round(elapsed / 1000)}s)`,
+          );
           if (openId) {
-            const sent = await sendAuthSuccessCard({ skillName, openId, accountId: ctx?.accountId || ctx?.account });
+            const sent = await sendAuthSuccessCard({
+              skillName,
+              openId,
+              accountId: ctx?.accountId || ctx?.account,
+            });
             if (!sent?.messageId && sent?.error) {
-              fileLog(`waitForAuth: auth success card failed for "${skillName}": ${sent.error}`);
+              fileLog(
+                `waitForAuth: auth success card failed for "${skillName}": ${sent.error}`,
+              );
             }
           }
           return;
         }
       }
     } catch (error) {
-      fileLog(`waitForAuth: poll failed for "${skillName}": ${error?.message || error}`);
+      fileLog(
+        `waitForAuth: poll failed for "${skillName}": ${error?.message || error}`,
+      );
     }
   };
 
@@ -599,11 +743,20 @@ export function startWaitForAuth({ authTargetKey, skillName, deviceCode, missing
   poll();
 }
 
-export async function sendAuthCard({ skillName, missing, verificationUrl, userCode, openId, accountId }) {
+export async function sendAuthCard({
+  skillName,
+  missing,
+  verificationUrl,
+  userCode,
+  openId,
+  accountId,
+}) {
   if (!openId) return { error: "no openId" };
   // 用 sidebar-semi applink 包裹，在飞书内以侧边栏打开，不跳转系统浏览器
   const authUrl = sidebarApplink(verificationUrl);
-  fileLog(`sendAuthCard: skill="${skillName}" authUrl=${authUrl || "<EMPTY!>"} userCode=${userCode || "<none>"} openId=${openId}`);
+  fileLog(
+    `sendAuthCard: skill="${skillName}" authUrl=${authUrl || "<EMPTY!>"} userCode=${userCode || "<none>"} openId=${openId}`,
+  );
   const scopeCount = missing.length;
   const scopeLines = missing.map((s) => `• \`${s}\``).join("\n");
   const card = {
@@ -612,8 +765,12 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
     header: {
       template: "orange",
       title: { tag: "plain_text", content: "飞书权限授权提醒" },
-      subtitle: { tag: "plain_text", content: `技能 “${skillName}” 需要你确认` },
-      icon: { ...LARK_AUTH_CARD_ICON },
+      subtitle: {
+        tag: "plain_text",
+        content: `技能 “${skillName}” 需要你确认`,
+      },
+      text_tag_list: LARK_AUTH_CARD_HEADER_TAGS,
+      icon: { tag: "standard_icon", token: "safe_outlined" },
     },
     body: {
       elements: [
@@ -626,14 +783,15 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
           expanded: false,
           background_color: "grey-50",
           header: {
-            title: { tag: "markdown", content: `**🔍 查看待授权权限（${scopeCount} 项）**` },
+            title: {
+              tag: "markdown",
+              content: `**🔍 查看待授权权限（${scopeCount} 项）**`,
+            },
             vertical_align: "center",
             icon_position: "right",
             icon_expanded_angle: -180,
           },
-          elements: [
-            { tag: "markdown", content: scopeLines },
-          ],
+          elements: [{ tag: "markdown", content: scopeLines }],
         },
         { tag: "hr" },
         {
@@ -645,9 +803,42 @@ export async function sendAuthCard({ skillName, missing, verificationUrl, userCo
           behaviors: [{ type: "open_url", default_url: authUrl }],
         },
         {
-          tag: "markdown",
-          content: `<font color='grey'>📝 点「前往授权」完成授权</font>`,
-        }
+          tag: "column_set",
+          flex_mode: "none",
+          background_style: "default",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "center",
+              elements: [
+                {
+                  tag: "markdown",
+                  content:
+                    "<font color='grey'>📝 点「前往授权」完成授权</font>",
+                },
+              ],
+            },
+            {
+              tag: "column",
+              width: "auto",
+              vertical_align: "center",
+              elements: [
+                {
+                  tag: "img",
+                  img_key: LARK_AUTH_CARD_FOOTER_IMAGE_KEY,
+                  alt: { tag: "plain_text", content: "Paper" },
+                  scale_type: "crop_center",
+                  size: "80px 24px",
+                  transparent: true,
+                  preview: false,
+                  margin: "0 0 0 8px",
+                },
+              ],
+            },
+          ],
+        },
       ],
     },
   };
