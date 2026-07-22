@@ -190,7 +190,7 @@ export function createPluginEntry(overrides = {}) {
   // ---------- 主入口（直接导出 plain entry object，无需 definePluginEntry）----------
   return {
     id: "openclaw-skill-runtime",
-    name: "OpenClaw Skill Runtime",
+    name: "openclaw-skill-runtime",
     description:
       "Ensure user Lark scopes declared in a skill's SKILL.md are granted before the skill is used.",
     register(api) {
