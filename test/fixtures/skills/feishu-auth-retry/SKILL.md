@@ -6,7 +6,8 @@ metadata:
     larkAuth:
       identity: user
       scopes:
-        - "acs:access_record:readonly"
+        - "aily:data_asset:upload_file"
+        - "base:block:create"
 ---
 
 # Feishu Auth Retry

@@ -64,7 +64,7 @@ function encodeAddons(addons) {
     .replace(/=+$/g, "");
 }
 
-export async function beginScopeGrantFlow({ appId, brand, scopes, source = "openclaw-skill-runtime" }) {
+export async function beginScopeGrantFlow({ appId, brand, scopes, identity = "user", source = "openclaw-skill-runtime" }) {
   if (!Array.isArray(scopes) || scopes.length === 0) {
     throw new Error("no scopes");
   }
@@ -93,6 +93,7 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
     throw new Error(payload?.error_description || payload?.error || `scope grant init failed: HTTP ${response.status}`);
   }
 
+  const normalizedIdentity = String(identity || "user").toLowerCase() === "app" ? "app" : "user";
   const verificationUrl = new URL(payload.verification_uri_complete || payload.verification_uri);
   verificationUrl.searchParams.set("from", source);
   verificationUrl.searchParams.set("source", source);
@@ -100,7 +101,7 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
   verificationUrl.searchParams.set("clientID", appId);
   verificationUrl.searchParams.set("addons", encodeAddons({
     scopes: {
-      user: [...new Set(scopes)],
+      [normalizedIdentity]: [...new Set(scopes)],
     },
   }));
 
@@ -112,6 +113,7 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
     interval: payload.interval || 5,
   };
 }
+
 
 export async function getTenantAccessToken(credentials) {
   const cacheKey = `${credentials.appId}::${credentials.appSecret}::${credentials.domain || ""}`;

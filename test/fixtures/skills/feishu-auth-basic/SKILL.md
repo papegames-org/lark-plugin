@@ -11,7 +11,6 @@ metadata:
         - "mail:user_mailbox.message.body:read"
         - "mail:user_mailbox.message.address:read"
         - "mail:user_mailbox.message.subject:read"
-        - "acs:access_record:readonly"
 ---
 
 # Feishu Auth Basic

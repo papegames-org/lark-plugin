@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-
 import {
   buildSkillRootsCacheKey,
   cacheSenderId,
+  checkUserGrant,
   getCachedSenderId,
   getDefaultSkillRoots,
   getAccountCredentials,
@@ -12,9 +12,14 @@ import {
   getSkillAuthCacheKey,
   resolveSkillReadTarget,
   sendAuthCard,
+  startLogin,
   setApiConfigRef,
   setPluginApiRef,
+  setLarkCliCommandRunnerForTest,
+  setLarkCliDeviceWaitSpawnerForTest,
   selectAuthedUserProfile,
+  normalizeAppScopeEntries,
+  normalizeAuthIdentity,
 } from "../utils.js";
 
 test("getDefaultSkillRoots includes agent and OpenClaw global skill roots", () => {
@@ -160,4 +165,87 @@ test("getAccountCredentials ignores legacy unknown accountId and falls back to t
       domain: null,
     });
   });
+});
+
+test("normalizeAppScopeEntries preserves identity for duplicate scope strings", () => {
+  const entries = normalizeAppScopeEntries([
+    { scope: "application:app_slash_command:read", identity_type: "app" },
+    { scope: "application:app_slash_command:read", identity_type: "user" },
+  ]);
+
+  assert.deepEqual(entries.map((entry) => `${entry.identity}::${entry.scope}`), [
+    "app::application:app_slash_command:read",
+    "user::application:app_slash_command:read",
+  ]);
+  assert.equal(normalizeAuthIdentity("application"), "app");
+  assert.equal(normalizeAuthIdentity("user"), "user");
+});
+
+test("checkUserGrant falls back to lark-cli auth check when runtime checker is unavailable", async () => {
+  const calls = [];
+  const oldProfile = process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+  delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+  const oldLarkProfile = process.env.LARK_PROFILE_NAME;
+  delete process.env.LARK_PROFILE_NAME;
+  setPluginApiRef(null);
+  setLarkCliCommandRunnerForTest(async (args) => {
+    calls.push(args);
+    return {
+      stdout: JSON.stringify({ ok: false, granted: ["scope:a"], missing: ["scope:b"] }),
+      stderr: "",
+      code: 0,
+    };
+  });
+
+  try {
+    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], {});
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.granted, ["scope:a"]);
+    assert.deepEqual(result.missing, ["scope:b"]);
+    assert.deepEqual(calls, [["auth", "check", "--json", "--scope", "scope:a scope:b"]]);
+  } finally {
+    if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+    else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
+    if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
+    else process.env.LARK_PROFILE_NAME = oldLarkProfile;
+    setLarkCliCommandRunnerForTest(null);
+    setPluginApiRef(null);
+  }
+});
+
+test("startLogin uses lark-cli device flow for user grants", async () => {
+  const commandCalls = [];
+  const spawnCalls = [];
+  const oldProfile = process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+  delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+  const oldLarkProfile = process.env.LARK_PROFILE_NAME;
+  delete process.env.LARK_PROFILE_NAME;
+  setLarkCliCommandRunnerForTest(async (args) => {
+    commandCalls.push(args);
+    return {
+      stdout: JSON.stringify({ verification_url: "https://example.com/user-login", device_code: "device-123", expires_in: 600, interval: 5 }),
+      stderr: "",
+      code: 0,
+    };
+  });
+  setLarkCliDeviceWaitSpawnerForTest((args) => {
+    spawnCalls.push(args);
+    return { started: true, pid: 1234 };
+  });
+
+  try {
+    const result = await startLogin(["scope:a"], {}, { identity: "user", authReason: "user_grant" });
+    assert.equal(result.verificationUrl, "https://example.com/user-login");
+    assert.equal(result.deviceCode, "device-123");
+    assert.equal(result.provider, "lark-cli");
+    assert.deepEqual(commandCalls, [["auth", "login", "--scope", "scope:a", "--no-wait", "--json"]]);
+    assert.deepEqual(spawnCalls, [["auth", "login", "--device-code", "device-123"]]);
+  } finally {
+    if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
+    else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
+    if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
+    else process.env.LARK_PROFILE_NAME = oldLarkProfile;
+    setLarkCliCommandRunnerForTest(null);
+    setLarkCliDeviceWaitSpawnerForTest(null);
+  }
 });
