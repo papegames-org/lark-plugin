@@ -56,6 +56,8 @@ export function createPendingAuthNotice(input, nowMs = Date.now()) {
     skillPath,
     accountId,
     openId: normalizeString(input?.openId),
+    identity: normalizeString(input?.identity),
+    authReason: normalizeString(input?.authReason),
     missing,
     missingKey: normalizeString(input?.missingKey) || missing.slice().sort().join("|"),
     verificationUrl,

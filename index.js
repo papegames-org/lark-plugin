@@ -17,12 +17,14 @@ import {
   cachedWorkspaceBySession,
   cacheSenderId,
   checkScopes,
+  checkUserGrant,
   fileLog,
   getAuthedUser,
   getAccountId,
   getCachedSenderId,
   getDefaultSkillRoots,
   getSkillAuthCacheKey,
+  normalizeAuthIdentity,
   inferSenderIdFromCtx,
   ensureFeishuRuntimeHealth,
   logCtxSnapshotOnce,
@@ -53,12 +55,14 @@ const baseDeps = {
   cachedWorkspaceBySession,
   cacheSenderId,
   checkScopes,
+  checkUserGrant,
   fileLog,
   getAuthedUser,
   getAccountId,
   getCachedSenderId,
   getDefaultSkillRoots,
   getSkillAuthCacheKey,
+  normalizeAuthIdentity,
   inferSenderIdFromCtx,
   ensureFeishuRuntimeHealth,
   logCtxSnapshotOnce,
@@ -92,12 +96,14 @@ export function createPluginEntry(overrides = {}) {
     cachedWorkspaceBySession,
     cacheSenderId,
     checkScopes,
+    checkUserGrant,
     fileLog,
     getAuthedUser,
     getAccountId,
     getCachedSenderId,
     getDefaultSkillRoots,
     getSkillAuthCacheKey,
+    normalizeAuthIdentity,
     inferSenderIdFromCtx,
     ensureFeishuRuntimeHealth,
     logCtxSnapshotOnce,
@@ -334,6 +340,8 @@ export function createPluginEntry(overrides = {}) {
         userCode: notice.userCode,
         openId: notice.openId,
         accountId: notice.accountId,
+        identity: notice.identity,
+        authReason: notice.authReason,
       });
       if (sent.messageId) {
         clearPendingAuthNotice(authTargetKey);
@@ -346,6 +354,8 @@ export function createPluginEntry(overrides = {}) {
           missingKey: notice.missingKey,
           openId: notice.openId,
           scopes: notice.missing,
+          identity: notice.identity,
+          authReason: notice.authReason,
           ctx: { accountId: notice.accountId },
         });
         return { ok: true, messageId: sent.messageId };
@@ -514,7 +524,8 @@ export function createPluginEntry(overrides = {}) {
           return;
         }
         const larkAuth = readLarkAuth(skillPath);
-        if (!larkAuth || larkAuth.identity !== "user" || !larkAuth.scopes.length) return;
+        if (!larkAuth || !larkAuth.scopes.length) return;
+        const identity = normalizeAuthIdentity(larkAuth.identity);
         const authTargetKey = getSkillAuthCacheKey(skillPath, ctx);
 
         const runtime = await ensureFeishuRuntimeHealth();
@@ -524,19 +535,36 @@ export function createPluginEntry(overrides = {}) {
           return blockRead ? { block: true, reason } : undefined;
         }
 
-        const check = await checkScopes(larkAuth.scopes, ctx);
-        if (check.ok) {
+        const appScopeCheck = await checkScopes(larkAuth.scopes, ctx, { identity });
+        let authReason = "app_scope";
+        let missing = appScopeCheck.missing?.length ? appScopeCheck.missing : [];
+        let resolvedUser = null;
+
+        if (appScopeCheck.ok && identity === "app") {
           clearPendingAuthNotice(authTargetKey);
           skillAuthCache.delete(authTargetKey);
           return;
         }
-        const missing = check.missing.length ? check.missing : larkAuth.scopes;
-        fileLog(`skill="${skillName}" missing: ${missing.join(", ")}`);
-        api.log?.info?.(`[openclaw-skill-runtime] skill="${skillName}" missing: ${missing.join(", ")}`);
+
+        if (appScopeCheck.ok && identity === "user") {
+          resolvedUser = await getAuthedUser(ctx).catch(() => null);
+          const userGrantCheck = await checkUserGrant(resolvedUser?.openId, larkAuth.scopes, ctx);
+          if (userGrantCheck.ok) {
+            clearPendingAuthNotice(authTargetKey);
+            skillAuthCache.delete(authTargetKey);
+            return;
+          }
+          authReason = "user_grant";
+          missing = userGrantCheck.missing?.length ? userGrantCheck.missing : larkAuth.scopes;
+          fileLog(`skill="${skillName}" user grant missing: ${missing.join(", ")} reason=${userGrantCheck.reason || "not granted"}`);
+        } else {
+          missing = missing.length ? missing : larkAuth.scopes;
+          fileLog(`skill="${skillName}" app ${identity} scopes missing: ${missing.join(", ")}`);
+        }
+
+        api.log?.info?.(`[openclaw-skill-runtime] skill="${skillName}" identity=${identity} authReason=${authReason} missing: ${missing.join(", ")}`);
         const now = Date.now();
         const resolvedAccountId = getAccountId(ctx);
-
-        let resolvedUser = null;
         const pendingNotice = pendingAuthNotices.get(authTargetKey);
         if (pendingNotice) {
           if (pendingNotice.status === "exhausted") {
@@ -578,7 +606,7 @@ export function createPluginEntry(overrides = {}) {
           return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;
         }
 
-        const login = await startLogin(missing, ctx);
+        const login = await startLogin(missing, ctx, { identity, authReason });
         if (login.verificationUrl) {
           const user = resolvedUser || await getAuthedUser(ctx);
           const sent = await sendAuthCard({
@@ -587,13 +615,15 @@ export function createPluginEntry(overrides = {}) {
             ...login,
             openId: user?.openId,
             accountId: resolvedAccountId,
+            identity,
+            authReason,
           });
           if (sent.messageId) {
             clearPendingAuthNotice(authTargetKey);
             skillAuthCache.set(authTargetKey, { missingKey, lastSentAtMs: now });
             const mode = blockRead ? "(blocked)" : "";
             fileLog(`auth card ${mode} "${skillName}" sent msg=${sent.messageId}`);
-            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, ctx });
+            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, identity, authReason, ctx });
           } else {
             fileLog(`sendAuthCard failed: ${sent.error}`);
             const notice = recordPendingAuthFailure({
@@ -607,6 +637,8 @@ export function createPluginEntry(overrides = {}) {
               verificationUrl: login.verificationUrl,
               userCode: login.userCode,
               deviceCode: login.deviceCode,
+              identity,
+              authReason,
               lastError: sent.error || "send failed",
             });
             if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
