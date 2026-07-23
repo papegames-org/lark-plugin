@@ -82,7 +82,26 @@ function installOpenClaw() {
 
   const tgzPath = join(staging, tgz);
   const install = run("openclaw", ["plugins", "install", tgzPath], { stdio: "inherit" });
-  process.exit(install.status || 0);
+  if (install.status !== 0) {
+    process.exit(install.status || 1);
+  }
+
+  const configureHookAccess = run("openclaw", [
+    "config",
+    "set",
+    "plugins.entries.openclaw-skill-runtime.hooks.allowConversationAccess",
+    "true",
+  ], { stdio: "inherit" });
+  if (configureHookAccess.status !== 0) {
+    process.stderr.write(
+      "Plugin installed, but enabling before_agent_run access failed. " +
+      "Run: openclaw config set plugins.entries.openclaw-skill-runtime.hooks.allowConversationAccess true\n",
+    );
+    process.exit(configureHookAccess.status || 1);
+  }
+
+  process.stdout.write("Plugin installed and early skill authorization enabled. Restart OpenClaw Gateway before testing.\n");
+  process.exit(0);
 }
 
 const argv = process.argv.slice(2);

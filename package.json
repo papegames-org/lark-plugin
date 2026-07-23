@@ -1,6 +1,6 @@
 {
   "name": "@jianguo_paper/openclaw-skill-runtime",
-  "version": "2.0.0",
+  "version": "2.0.12",
   "description": "OpenClaw plugin that pre-authorizes Feishu scopes declared by SKILL.md before skill use.",
   "type": "module",
   "main": "index.js",
@@ -12,6 +12,7 @@
     "docs",
     "feishu-runtime.js",
     "index.js",
+    "lark-cli-auth.js",
     "openclaw.plugin.json",
     "pending-auth.js",
     "parse-meta.js",
@@ -40,6 +41,8 @@
   ],
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./index.js"]
+    "extensions": [
+      "./index.js"
+    ]
   }
 }

@@ -1,0 +1,11 @@
+{
+  "name": "workkit",
+  "version": "0.1.0",
+  "source": "/Users/m10003000234/Desktop/workspace/projects/code/workkit",
+  "entry": "packages/cli/dist/index.js",
+  "runtimePackages": [
+    "@workkit/approval",
+    "@workkit/card-kit",
+    "@workkit/core"
+  ]
+}

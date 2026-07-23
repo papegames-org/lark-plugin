@@ -16,7 +16,10 @@ import {
   cachedAccountBySession,
   cachedWorkspaceBySession,
   cacheSenderId,
+  checkApplicationAuthorization,
   checkScopes,
+  checkUserAuthorization,
+  checkUserAuthorizationByLarkCli,
   fileLog,
   getAuthedUser,
   getAccountId,
@@ -52,7 +55,10 @@ const baseDeps = {
   cachedAccountBySession,
   cachedWorkspaceBySession,
   cacheSenderId,
+  checkApplicationAuthorization,
   checkScopes,
+  checkUserAuthorization,
+  checkUserAuthorizationByLarkCli,
   fileLog,
   getAuthedUser,
   getAccountId,
@@ -91,7 +97,10 @@ export function createPluginEntry(overrides = {}) {
     cachedAccountBySession,
     cachedWorkspaceBySession,
     cacheSenderId,
+    checkApplicationAuthorization,
     checkScopes,
+    checkUserAuthorization,
+    checkUserAuthorizationByLarkCli,
     fileLog,
     getAuthedUser,
     getAccountId,
@@ -133,6 +142,8 @@ export function createPluginEntry(overrides = {}) {
     return {
       eventKeys: event ? Object.keys(event) : null,
       ctxKeys: ctx ? Object.keys(ctx) : null,
+      eventSenderId: event?.senderId || event?.senderOpenId || event?.sender?.id || event?.sender?.open_id || event?.sender?.openId || null,
+      ctxSenderId: ctx?.senderId || ctx?.senderOpenId || ctx?.openId || null,
       eventTrigger: event?.trigger || null,
       ctxTrigger: ctx?.trigger || null,
       eventSkillCommand: event?.skillCommand || null,
@@ -187,6 +198,11 @@ export function createPluginEntry(overrides = {}) {
     ].filter(Boolean))];
   }
 
+  function hasEarlySkillGateEnabled(config) {
+    return config?.plugins?.entries?.["openclaw-skill-runtime"]?.hooks
+      ?.allowConversationAccess === true;
+  }
+
   // ---------- 主入口（直接导出 plain entry object，无需 definePluginEntry）----------
   return {
     id: "openclaw-skill-runtime",
@@ -208,9 +224,17 @@ export function createPluginEntry(overrides = {}) {
     }
     // 插件私有配置在 api.pluginConfig（不是 api.config）
     const cfg = api.pluginConfig || {};
+    const userAuthProvider = cfg.userAuthProvider === "context" ? "context" : "lark-cli";
     setPluginApiRef(api);
     resetRuntimeCaches();
     if (cfg.enabled === false) { fileLog("disabled by config"); return; }
+    if (!hasEarlySkillGateEnabled(api.config)) {
+      const recoveryHint = "Early skill authorization is disabled. Run: "
+        + "openclaw config set plugins.entries.openclaw-skill-runtime.hooks.allowConversationAccess true "
+        + "and restart the OpenClaw Gateway.";
+      api.log?.warn?.(`[openclaw-skill-runtime] ${recoveryHint}`);
+      fileLog(`configuration warning: ${recoveryHint}`);
+    }
     const blockRead = cfg.blockRead !== false;
     ensureFeishuRuntimeHealth().then((info) => {
       if (!info.ok) {
@@ -249,6 +273,11 @@ export function createPluginEntry(overrides = {}) {
     const pendingAuthNotices = pendingAuthRuntime.notices;
     const pendingAuthRetryTimers = pendingAuthRuntime.retryTimers;
     const skillAuthCache = new Map();
+    const explicitSkillBySession = new Map();
+    // Keep a verified explicit Skill gate for the rest of the session. This is
+    // only populated after its own before_agent_run authorization preflight
+    // failed, so it cannot turn arbitrary tool calls into a broad interceptor.
+    const blockedExplicitSkillBySession = new Map();
 
     function persistPendingAuthNotices() {
       writePendingAuthNoticeStore(pendingAuthStorePath, pendingAuthNotices);
@@ -319,7 +348,7 @@ export function createPluginEntry(overrides = {}) {
         ? updatePendingAuthNotice(authTargetKey, { openId: updates.openId }) || current
         : current;
 
-      if (!notice.openId) {
+      if (!notice.openId && !notice.chatId) {
         const failedNotice = recordPendingAuthFailure({
           ...notice,
           lastError: "recipient unresolved",
@@ -330,10 +359,15 @@ export function createPluginEntry(overrides = {}) {
       const sent = await sendAuthCard({
         skillName: notice.skillName,
         missing: notice.missing,
+        declaredScopes: notice.declaredScopes,
         verificationUrl: notice.verificationUrl,
         userCode: notice.userCode,
         openId: notice.openId,
+        chatId: notice.chatId,
         accountId: notice.accountId,
+        identity: notice.identity,
+        checkPhase: notice.checkPhase,
+        ctx: { accountId: notice.accountId, channelId: notice.chatId || null },
       });
       if (sent.messageId) {
         clearPendingAuthNotice(authTargetKey);
@@ -347,6 +381,10 @@ export function createPluginEntry(overrides = {}) {
           openId: notice.openId,
           scopes: notice.missing,
           ctx: { accountId: notice.accountId },
+          identity: notice.identity,
+          checkPhase: notice.checkPhase,
+          userAuthProvider: notice.userAuthProvider,
+          larkCliPath: notice.larkCliPath,
         });
         return { ok: true, messageId: sent.messageId };
       }
@@ -389,6 +427,292 @@ export function createPluginEntry(overrides = {}) {
       fileLog(`pendingAuth restored notices=${pendingAuthNotices.size}`);
     }
 
+    function resolveExplicitSkillName(prompt) {
+      if (typeof prompt !== "string") return null;
+      const match = /(?:^|\r?\n)Use the "([^"\r\n]+)" skill for this request\.(?:\r?\n|$)/u.exec(prompt);
+      return normalizeSkillName(match?.[1]);
+    }
+
+    function resolveExplicitSkillNameFromMessage(event) {
+      const candidates = [
+        event?.text,
+        event?.content,
+        event?.message?.text,
+        event?.message?.content,
+      ];
+      for (const candidate of candidates) {
+        if (typeof candidate !== "string") continue;
+        const command = /^\s*\/skill\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*$/u.exec(candidate)
+          || /^\s*执行\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:这个)?(?:skill|技能)?[。！!]*\s*$/iu.exec(candidate)
+          || /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*$/u.exec(candidate);
+        const skillName = normalizeSkillName(command?.[1]);
+        if (skillName) return skillName;
+      }
+      return null;
+    }
+
+    function resolveExplicitSkillNameFromPromptBuildEvent(event) {
+      const candidates = [event?.prompt];
+      if (Array.isArray(event?.messages)) {
+        for (const message of event.messages) {
+          if (typeof message === "string") candidates.push(message);
+          else if (message && typeof message === "object") {
+            candidates.push(message.text, message.content, message?.content?.text);
+          }
+        }
+      }
+      for (const candidate of candidates) {
+        const skillName = resolveExplicitSkillNameFromMessage({ text: candidate });
+        if (skillName) return skillName;
+      }
+      return null;
+    }
+
+    function getExplicitSkillCacheKeys(ctx) {
+      const keys = [ctx?.sessionId, ctx?.sessionKey];
+      for (const channelKey of [ctx?.channelId, ctx?.conversationId]) {
+        if (typeof channelKey === "string" && channelKey) keys.push(`channel:${channelKey}`);
+      }
+      return [...new Set(keys.filter((key) => typeof key === "string" && key))];
+    }
+
+    function cacheExplicitSkillName(ctx, skillName) {
+      if (!skillName) return;
+      for (const key of getExplicitSkillCacheKeys(ctx)) explicitSkillBySession.set(key, skillName);
+    }
+
+    function takeCachedExplicitSkillName(ctx) {
+      for (const key of getExplicitSkillCacheKeys(ctx)) {
+        const skillName = explicitSkillBySession.get(key);
+        if (!skillName) continue;
+        for (const clearKey of getExplicitSkillCacheKeys(ctx)) explicitSkillBySession.delete(clearKey);
+        return skillName;
+      }
+      return null;
+    }
+
+    function cacheBlockedExplicitSkill(ctx, target) {
+      if (!target?.skillName || !target?.skillPath) return;
+      for (const key of [ctx?.sessionId, ctx?.sessionKey]) {
+        if (typeof key === "string" && key) blockedExplicitSkillBySession.set(key, target);
+      }
+    }
+
+    function getBlockedExplicitSkill(ctx) {
+      for (const key of [ctx?.sessionId, ctx?.sessionKey]) {
+        if (typeof key !== "string" || !key) continue;
+        const target = blockedExplicitSkillBySession.get(key);
+        if (target) return target;
+      }
+      return null;
+    }
+
+    function clearBlockedExplicitSkill(ctx) {
+      for (const key of [ctx?.sessionId, ctx?.sessionKey]) {
+        if (typeof key === "string" && key) blockedExplicitSkillBySession.delete(key);
+      }
+    }
+
+    function resolveSkillPathByName(skillMapEntry, skillName) {
+      if (!skillName) return null;
+      for (const [skillPath, candidateSkillName] of skillMapEntry.map.entries()) {
+        if (candidateSkillName === skillName) return skillPath;
+      }
+      return null;
+    }
+
+    function normalizeAuthDeclaration(input) {
+      const scopes = Array.isArray(input?.scopes)
+        ? [...new Set(input.scopes.map((scope) => typeof scope === "string" ? scope.trim() : "").filter(Boolean))]
+        : [];
+      if (scopes.length === 0) return null;
+      return {
+        identity: input?.identity === "app" ? "app" : "user",
+        scopes,
+      };
+    }
+
+    function resolveToolAuth(toolName) {
+      if (!toolName || !cfg.toolAuth || typeof cfg.toolAuth !== "object") return null;
+      return normalizeAuthDeclaration(cfg.toolAuth[toolName]);
+    }
+
+    function buildAuthContext(event, ctx) {
+      const authCtx = {
+        ...(ctx || {}),
+      };
+      const accountId = event?.accountId || ctx?.accountId || ctx?.account || null;
+      const channelId = event?.channelId || ctx?.channelId || null;
+      const senderId = event?.senderId || event?.senderOpenId || event?.sender?.id || event?.sender?.open_id || event?.sender?.openId || getCachedSenderId(ctx) || inferSenderIdFromCtx(ctx) || null;
+      if (accountId) authCtx.accountId = accountId;
+      if (channelId) authCtx.channelId = channelId;
+      if (senderId) {
+        authCtx.senderId = senderId;
+        cacheSenderId(authCtx, senderId);
+      }
+      return authCtx;
+    }
+
+    async function preflightAuthDeclaration({ targetName, targetPath, larkAuth, ctx }) {
+      if (!larkAuth || !larkAuth.scopes.length) return null;
+      const authTargetKey = getSkillAuthCacheKey(targetPath, ctx);
+
+      const runtime = await ensureFeishuRuntimeHealth();
+      if (!runtime.ok) {
+        const reason = `技能「${targetName}」依赖的飞书运行时当前不可用，无法完成权限校验。${runtime.recoveryHint || "请补齐 Feishu 应用凭据后重试。"}`;
+        fileLog(`runtime blocked target="${targetName}" reason=${reason}`);
+        return blockRead ? reason : null;
+      }
+
+      const appScopeCheck = await checkApplicationAuthorization(larkAuth.scopes, larkAuth.identity, ctx);
+      let authPhase = "app_scope";
+      let check = {
+        ok: appScopeCheck.ok,
+        missing: [...(appScopeCheck.missing || []), ...(appScopeCheck.incompatible || [])],
+      };
+      if (appScopeCheck.ok && larkAuth.identity === "user") {
+        authPhase = "user_grant";
+        check = userAuthProvider === "lark-cli"
+          ? await checkUserAuthorizationByLarkCli(larkAuth.scopes, ctx, {
+            larkCliPath: cfg.larkCliPath,
+          })
+          : await checkUserAuthorization(larkAuth.scopes, ctx);
+      }
+      if (check.ok) {
+        clearPendingAuthNotice(authTargetKey);
+        skillAuthCache.delete(authTargetKey);
+        return null;
+      }
+      const missing = check.missing.length ? check.missing : larkAuth.scopes;
+      fileLog(`target="${targetName}" missing phase=${authPhase} identity=${larkAuth.identity}: ${missing.join(", ")}`);
+      api.log?.info?.(`[openclaw-skill-runtime] target="${targetName}" missing phase=${authPhase} identity=${larkAuth.identity}: ${missing.join(", ")}`);
+      const now = Date.now();
+      const resolvedAccountId = getAccountId(ctx);
+
+      let resolvedUser = null;
+      const pendingNotice = pendingAuthNotices.get(authTargetKey);
+      if (pendingNotice?.status === "exhausted") {
+        fileLog(`pendingAuth exhausted notice reopened authTargetKey="${authTargetKey}"`);
+        clearPendingAuthNotice(authTargetKey);
+      }
+
+      const resumedPendingNotice = pendingAuthNotices.get(authTargetKey);
+      if (resumedPendingNotice) {
+        if (!resumedPendingNotice.openId) {
+          resolvedUser = await getAuthedUser(ctx).catch(() => null);
+          if (resolvedUser?.openId) updatePendingAuthNotice(authTargetKey, { openId: resolvedUser.openId });
+        }
+        if (canRetryPendingAuthNotice(resumedPendingNotice, { nowMs: now })) {
+          const retried = await retryPendingAuthNotice(authTargetKey, { openId: resolvedUser?.openId });
+          if (retried.ok) {
+            return blockRead ? `技能「${targetName}」需要飞书权限授权，已重新发送授权卡片，请完成授权后重试。` : null;
+          }
+          const latestNotice = pendingAuthNotices.get(authTargetKey);
+          if (latestNotice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
+        }
+        const latestPendingNotice = pendingAuthNotices.get(authTargetKey);
+        if (latestPendingNotice) {
+          const reason = latestPendingNotice.status === "exhausted"
+            ? `技能「${targetName}」需要飞书权限授权，但授权提醒连续发送失败，请稍后重试或执行诊断命令排查。`
+            : `技能「${targetName}」需要飞书权限授权，授权提醒发送失败，系统会自动重试，请稍后重试。`;
+          return blockRead ? reason : null;
+        }
+      }
+
+      const cache = skillAuthCache.get(authTargetKey);
+      const missingKey = `${larkAuth.identity}:${authPhase}:${missing.slice().sort().join("|")}`;
+      if (cache) {
+        fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
+      }
+      if (cache && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
+        fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
+        return blockRead ? `技能「${targetName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` : null;
+      }
+
+      const login = await startLogin(missing, ctx, {
+        identity: larkAuth.identity,
+        checkPhase: authPhase,
+        redirectUri: cfg.userOAuthRedirectUri,
+        userAuthProvider,
+        larkCliPath: cfg.larkCliPath,
+      });
+      if (login.verificationUrl) {
+        const user = resolvedUser || await getAuthedUser(ctx);
+        const chatId = typeof ctx?.channelId === "string" && /^oc_[A-Za-z0-9]/.test(ctx.channelId.trim())
+          ? ctx.channelId.trim()
+          : null;
+        const sent = await sendAuthCard({
+          skillName: targetName,
+          missing,
+          declaredScopes: larkAuth.scopes,
+          ...login,
+          openId: user?.openId,
+          chatId,
+          accountId: resolvedAccountId,
+          identity: larkAuth.identity,
+          checkPhase: authPhase,
+          ctx,
+        });
+        if (sent.messageId) {
+          clearPendingAuthNotice(authTargetKey);
+          skillAuthCache.set(authTargetKey, { missingKey, lastSentAtMs: now });
+          const mode = blockRead ? "(blocked)" : "";
+          fileLog(`auth card ${mode} "${targetName}" sent msg=${sent.messageId}`);
+          startWaitForAuth({
+            authTargetKey,
+            skillName: targetName,
+            deviceCode: login.deviceCode,
+            missingKey,
+            openId: user?.openId,
+            scopes: missing,
+            ctx,
+            identity: larkAuth.identity,
+            checkPhase: authPhase,
+            userAuthProvider,
+            larkCliPath: cfg.larkCliPath,
+          });
+        } else {
+          fileLog(`sendAuthCard failed: ${sent.error}`);
+          const notice = recordPendingAuthFailure({
+            authTargetKey,
+            skillName: targetName,
+            skillPath: targetPath,
+            accountId: resolvedAccountId,
+            openId: user?.openId || null,
+            chatId,
+            identity: larkAuth.identity,
+            checkPhase: authPhase,
+            missing,
+            declaredScopes: larkAuth.scopes,
+            missingKey,
+            verificationUrl: login.verificationUrl,
+            userCode: login.userCode,
+            deviceCode: login.deviceCode,
+            userAuthProvider,
+            larkCliPath: cfg.larkCliPath,
+            lastError: sent.error || "send failed",
+          });
+          if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
+        }
+      } else {
+        fileLog(`startLogin failed "${targetName}": ${login.error}`);
+      }
+      if (!blockRead) return null;
+      return pendingAuthNotices.has(authTargetKey)
+        ? `技能「${targetName}」需要飞书权限授权，授权提醒发送失败，系统会自动重试，请稍后重试。`
+        : `技能「${targetName}」需要飞书权限授权，已发送授权卡片，请先完成授权后重试。`;
+    }
+
+    async function preflightSkillAuth({ skillName, skillPath, ctx }) {
+      const larkAuth = readLarkAuth(skillPath);
+      return preflightAuthDeclaration({
+        targetName: skillName,
+        targetPath: skillPath,
+        larkAuth,
+        ctx,
+      });
+    }
+
     api.on("before_prompt_build", async (event, ctx) => {
       if (ctx?.workspaceDir && ctx?.sessionId) {
         cachedWorkspaceBySession.set(ctx.sessionId, ctx.workspaceDir);
@@ -411,6 +735,15 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`senderId: inferred from before_prompt_build sessionId=${ctx?.sessionId || "<none>"} channelId=${ctx?.channelId || "<none>"} -> ${inferredSenderId}`);
         }
       }
+      const explicitSkillName = resolveExplicitSkillNameFromPromptBuildEvent(event);
+      if (!explicitSkillName) return;
+      const skillMapEntry = getSkillMapEntry(ctx);
+      if (!resolveSkillPathByName(skillMapEntry, explicitSkillName)) {
+        fileLog(`before_prompt_build: explicit skill="${explicitSkillName}" not found in skillMap size=${skillMapEntry.map.size}`);
+        return;
+      }
+      cacheExplicitSkillName(ctx, explicitSkillName);
+      fileLog(`before_prompt_build: cached explicit skill="${explicitSkillName}" sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"}`);
     });
 
     api.on("message_received", async (event, ctx) => {
@@ -428,7 +761,56 @@ export function createPluginEntry(overrides = {}) {
         cacheSenderId({ sessionId: sid, sessionKey: skey }, senderId);
         fileLog(`senderId: cached from message_received sessionId=${sid || "<none>"} sessionKey=${skey || "<none>"} -> ${senderId}`);
       }
+      const explicitSkillName = resolveExplicitSkillNameFromMessage(event);
+      if (!explicitSkillName) return;
+      const skillMapEntry = getSkillMapEntry(ctx);
+      if (!resolveSkillPathByName(skillMapEntry, explicitSkillName)) {
+        fileLog(`message_received: explicit skill="${explicitSkillName}" not found in skillMap size=${skillMapEntry.map.size}`);
+        return;
+      }
+      cacheExplicitSkillName(ctx, explicitSkillName);
+      fileLog(`message_received: cached explicit skill="${explicitSkillName}" sessionId=${sid || "<none>"} sessionKey=${skey || "<none>"}`);
     });
+
+    api.on("before_agent_run", async (event, ctx) => {
+      try {
+        if ((ctx?.messageProvider || ctx?.channel) !== "feishu") return;
+        const skillName = resolveExplicitSkillName(event?.prompt) || takeCachedExplicitSkillName(ctx);
+        if (!skillName) return;
+        const authCtx = buildAuthContext(event, ctx);
+        const skillMapEntry = getSkillMapEntry(authCtx);
+        const skillPath = resolveSkillPathByName(skillMapEntry, skillName);
+        if (!skillPath) {
+          fileLog(`before_agent_run: explicit skill="${skillName}" not found in skillMap size=${skillMapEntry.map.size}`);
+          return;
+        }
+        fileLog(`before_agent_run: explicit skill="${skillName}" path="${skillPath}" runId=${ctx?.runId || "<none>"}`);
+        const reason = await preflightSkillAuth({ skillName, skillPath, ctx: authCtx });
+        if (!reason) return;
+        cacheBlockedExplicitSkill(authCtx, {
+          skillName,
+          skillPath,
+          accountId: authCtx.accountId || null,
+          senderId: authCtx.senderId || null,
+        });
+        return {
+          outcome: "block",
+          reason: `skill authorization required: ${skillName}`,
+          message: reason,
+          category: "skill_authorization",
+          metadata: { skillName },
+        };
+      } catch (error) {
+        const reason = `技能权限预检失败：${error?.message || error}`;
+        fileLog(`before_agent_run error: ${error?.message || error}`);
+        return blockRead ? {
+          outcome: "block",
+          reason: "skill authorization preflight failed",
+          message: reason,
+          category: "skill_authorization_error",
+        } : undefined;
+      }
+    }, { priority: 80, timeoutMs: 40000 });
 
     api.on("before_tool_call", async (event, ctx) => {
       try {
@@ -436,18 +818,65 @@ export function createPluginEntry(overrides = {}) {
         fileLog(`hook: tool=${event?.toolName || ""} channel=${ctx?.channel || ""} path=${event?.params?.path || ""}`);
         fileLog(`before_tool_call summary=${safeJson(buildHookDebugSummary(event, ctx))}`);
         if (ctx && ctx.channel && ctx.channel !== "feishu") return;
+        const blockedExplicitSkill = getBlockedExplicitSkill(ctx);
+        if (blockedExplicitSkill) {
+          const authCtx = buildAuthContext(event, {
+            ...(ctx || {}),
+            accountId: ctx?.accountId || blockedExplicitSkill.accountId || null,
+            senderId: ctx?.senderId || blockedExplicitSkill.senderId || null,
+          });
+          const reason = await preflightSkillAuth({ ...blockedExplicitSkill, ctx: authCtx });
+          if (reason) {
+            fileLog(`before_tool_call: blocked explicit skill session target="${blockedExplicitSkill.skillName}" tool=${event?.toolName || "<none>"}`);
+            return { block: true, reason };
+          }
+          clearBlockedExplicitSkill(ctx);
+        }
+        const cachedExplicitSkillName = takeCachedExplicitSkillName(ctx);
+        if (cachedExplicitSkillName) {
+          const authCtx = buildAuthContext(event, ctx);
+          const skillMapEntry = getSkillMapEntry(authCtx);
+          const skillPath = resolveSkillPathByName(skillMapEntry, cachedExplicitSkillName);
+          if (!skillPath) {
+            fileLog(`before_tool_call: cached explicit skill="${cachedExplicitSkillName}" not found in skillMap size=${skillMapEntry.map.size}`);
+          } else {
+            const reason = await preflightSkillAuth({ skillName: cachedExplicitSkillName, skillPath, ctx: authCtx });
+            if (reason) {
+              cacheBlockedExplicitSkill(authCtx, {
+                skillName: cachedExplicitSkillName,
+                skillPath,
+                accountId: authCtx.accountId || null,
+                senderId: authCtx.senderId || null,
+              });
+              fileLog(`before_tool_call: blocked cached explicit skill="${cachedExplicitSkillName}" tool=${event?.toolName || "<none>"}`);
+              return { block: true, reason };
+            }
+          }
+        }
         const rawPath = event.params?.path;
         const wsDir = resolveWorkspaceDir(ctx);
         const directTarget = resolveSkillReadTarget(rawPath, ctx?.cwd, wsDir);
         const skillNameCandidates = collectSkillNameCandidates(event, ctx, directTarget);
         const isReadTool = event.toolName === "read";
-        if (!isReadTool && skillNameCandidates.length === 0) return;
+        const toolAuth = !isReadTool ? resolveToolAuth(event?.toolName) : null;
+        if (!isReadTool && skillNameCandidates.length === 0 && !toolAuth) return;
         if (isReadTool) {
           fileLog(`hook: read-enter rawPath=${event?.params?.path || ""} cwd=${ctx?.cwd || ""}`);
+        } else if (toolAuth && skillNameCandidates.length === 0) {
+          fileLog(`hook: configured-tool-auth-enter tool=${event?.toolName || ""}`);
         } else {
           fileLog(`hook: skill-runtime-enter tool=${event?.toolName || ""} skillCandidates=${skillNameCandidates.join(",") || "<none>"}`);
         }
-        if (!rawPath && skillNameCandidates.length === 0) return;
+        if (!rawPath && skillNameCandidates.length === 0 && !toolAuth) return;
+        if (!ctx?.senderId) {
+          const senderFromEvent = event?.senderId || event?.senderOpenId || event?.sender?.id || event?.sender?.open_id || event?.sender?.openId || null;
+          if (typeof senderFromEvent === "string" && /^ou_[A-Za-z0-9]/.test(senderFromEvent.trim())) {
+            const normalized = senderFromEvent.trim();
+            try { ctx.senderId = normalized; } catch {}
+            cacheSenderId(ctx, normalized);
+            fileLog(`senderId: restored from event for before_tool_call sessionId=${ctx?.sessionId || "<none>"} -> ${normalized}`);
+          }
+        }
         if (!ctx?.senderId) {
           const cachedSenderId = getCachedSenderId(ctx);
           if (cachedSenderId) {
@@ -461,6 +890,16 @@ export function createPluginEntry(overrides = {}) {
               fileLog(`senderId: inferred for before_tool_call sessionId=${ctx?.sessionId || "<none>"} channelId=${ctx?.channelId || "<none>"} -> ${inferredSenderId}`);
             }
           }
+        }
+        if (toolAuth && skillNameCandidates.length === 0) {
+          const authCtx = buildAuthContext(event, ctx);
+          const reason = await preflightAuthDeclaration({
+            targetName: event.toolName,
+            targetPath: `tool:${event.toolName}`,
+            larkAuth: toolAuth,
+            ctx: authCtx,
+          });
+          return reason ? { block: true, reason } : undefined;
         }
         const skillMapEntry = getSkillMapEntry(ctx);
         const abs = directTarget?.abs || resolvePath(rawPath, ctx?.cwd, wsDir);
@@ -513,116 +952,9 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: matched skillName="${skillName}" but could not resolve SKILL.md path`);
           return;
         }
-        const larkAuth = readLarkAuth(skillPath);
-        if (!larkAuth || larkAuth.identity !== "user" || !larkAuth.scopes.length) return;
-        const authTargetKey = getSkillAuthCacheKey(skillPath, ctx);
-
-        const runtime = await ensureFeishuRuntimeHealth();
-        if (!runtime.ok) {
-          const reason = `技能「${skillName}」依赖的飞书运行时当前不可用，无法完成权限校验。${runtime.recoveryHint || "请补齐 Feishu 应用凭据后重试。"}`;
-          fileLog(`runtime blocked skill="${skillName}" reason=${reason}`);
-          return blockRead ? { block: true, reason } : undefined;
-        }
-
-        const check = await checkScopes(larkAuth.scopes, ctx);
-        if (check.ok) {
-          clearPendingAuthNotice(authTargetKey);
-          skillAuthCache.delete(authTargetKey);
-          return;
-        }
-        const missing = check.missing.length ? check.missing : larkAuth.scopes;
-        fileLog(`skill="${skillName}" missing: ${missing.join(", ")}`);
-        api.log?.info?.(`[openclaw-skill-runtime] skill="${skillName}" missing: ${missing.join(", ")}`);
-        const now = Date.now();
-        const resolvedAccountId = getAccountId(ctx);
-
-        let resolvedUser = null;
-        const pendingNotice = pendingAuthNotices.get(authTargetKey);
-        if (pendingNotice) {
-          if (pendingNotice.status === "exhausted") {
-            fileLog(`pendingAuth exhausted notice reopened authTargetKey="${authTargetKey}"`);
-            clearPendingAuthNotice(authTargetKey);
-          }
-        }
-
-        const resumedPendingNotice = pendingAuthNotices.get(authTargetKey);
-        if (resumedPendingNotice) {
-          if (!resumedPendingNotice.openId) {
-            resolvedUser = await getAuthedUser(ctx).catch(() => null);
-            if (resolvedUser?.openId) updatePendingAuthNotice(authTargetKey, { openId: resolvedUser.openId });
-          }
-          if (canRetryPendingAuthNotice(resumedPendingNotice, { nowMs: now })) {
-            const retried = await retryPendingAuthNotice(authTargetKey, { openId: resolvedUser?.openId });
-            if (retried.ok) {
-              return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，已重新发送授权卡片，请完成授权后重试。` } : undefined;
-            }
-            const latestNotice = pendingAuthNotices.get(authTargetKey);
-            if (latestNotice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
-          }
-          const latestPendingNotice = pendingAuthNotices.get(authTargetKey);
-          if (latestPendingNotice) {
-            const reason = latestPendingNotice.status === "exhausted"
-              ? `技能「${skillName}」需要飞书权限授权，但授权提醒连续发送失败，请稍后重试或执行诊断命令排查。`
-              : `技能「${skillName}」需要飞书权限授权，授权提醒发送失败，系统会自动重试，请稍后重试。`;
-            return blockRead ? { block: true, reason } : undefined;
-          }
-        }
-
-        const cache = skillAuthCache.get(authTargetKey);
-        const missingKey = missing.slice().sort().join("|");
-        if (cache) {
-          fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
-        }
-        if (cache && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
-          fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
-          return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;
-        }
-
-        const login = await startLogin(missing, ctx);
-        if (login.verificationUrl) {
-          const user = resolvedUser || await getAuthedUser(ctx);
-          const sent = await sendAuthCard({
-            skillName,
-            missing,
-            ...login,
-            openId: user?.openId,
-            accountId: resolvedAccountId,
-          });
-          if (sent.messageId) {
-            clearPendingAuthNotice(authTargetKey);
-            skillAuthCache.set(authTargetKey, { missingKey, lastSentAtMs: now });
-            const mode = blockRead ? "(blocked)" : "";
-            fileLog(`auth card ${mode} "${skillName}" sent msg=${sent.messageId}`);
-            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, ctx });
-          } else {
-            fileLog(`sendAuthCard failed: ${sent.error}`);
-            const notice = recordPendingAuthFailure({
-              authTargetKey,
-              skillName,
-              skillPath,
-              accountId: resolvedAccountId,
-              openId: user?.openId || null,
-              missing,
-              missingKey,
-              verificationUrl: login.verificationUrl,
-              userCode: login.userCode,
-              deviceCode: login.deviceCode,
-              lastError: sent.error || "send failed",
-            });
-            if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
-          }
-        } else {
-          fileLog(`startLogin failed "${skillName}": ${login.error}`);
-        }
-        // 无论发卡是否成功，只要 blockRead=true 且 scopes 缺失，一律拦截 read，
-        // 防止模型拿到 SKILL.md 内容后绕过授权直接执行 skill。
-        if (blockRead) {
-          const reason = pendingAuthNotices.has(authTargetKey)
-            ? `技能「${skillName}」需要飞书权限授权，授权提醒发送失败，系统会自动重试，请稍后重试。`
-            : `技能「${skillName}」需要飞书权限授权，已发送授权卡片，请先完成授权后重试。`;
-          return { block: true, reason };
-        }
-        return;
+        const authCtx = buildAuthContext(event, ctx);
+        const reason = await preflightSkillAuth({ skillName, skillPath, ctx: authCtx });
+        return reason ? { block: true, reason } : undefined;
       } catch (e) {
         fileLog(`hook error: ${e?.message || e}`);
         return;

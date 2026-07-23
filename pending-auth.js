@@ -37,8 +37,32 @@ function normalizeScopes(scopes) {
   return [...new Set(scopes.map((scope) => normalizeString(scope)).filter(Boolean))];
 }
 
+function normalizeIdentity(value) {
+  return value === "app" ? "app" : "user";
+}
+
+function normalizeCheckPhase(value) {
+  return value === "user_grant" ? "user_grant" : "app_scope";
+}
+
+function normalizeUserAuthProvider(value) {
+  return value === "lark-cli" ? "lark-cli" : "context";
+}
+
+function normalizeCliPath(value) {
+  const path = normalizeString(value);
+  return path && !/\s/.test(path) ? path : null;
+}
+
+function normalizeChatId(value) {
+  const chatId = normalizeString(value);
+  if (!chatId) return null;
+  return /^oc_[A-Za-z0-9]/.test(chatId) ? chatId : null;
+}
+
 export function createPendingAuthNotice(input, nowMs = Date.now()) {
   const missing = normalizeScopes(input?.missing);
+  const declaredScopes = normalizeScopes(input?.declaredScopes);
   const authTargetKey = normalizeString(input?.authTargetKey);
   const skillName = normalizeString(input?.skillName);
   const skillPath = normalizeString(input?.skillPath);
@@ -56,7 +80,13 @@ export function createPendingAuthNotice(input, nowMs = Date.now()) {
     skillPath,
     accountId,
     openId: normalizeString(input?.openId),
+    chatId: normalizeChatId(input?.chatId),
+    identity: normalizeIdentity(input?.identity),
+    checkPhase: normalizeCheckPhase(input?.checkPhase),
+    userAuthProvider: normalizeUserAuthProvider(input?.userAuthProvider),
+    larkCliPath: normalizeCliPath(input?.larkCliPath),
     missing,
+    declaredScopes: declaredScopes.length ? declaredScopes : missing,
     missingKey: normalizeString(input?.missingKey) || missing.slice().sort().join("|"),
     verificationUrl,
     userCode: normalizeString(input?.userCode),

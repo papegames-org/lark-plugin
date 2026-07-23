@@ -1,0 +1,20 @@
+{
+  "name": "workkit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight employee-work toolkit for approvals and future staff-service domains.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty",
+    "clean": "rm -rf packages/*/dist"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.7.0"
+}

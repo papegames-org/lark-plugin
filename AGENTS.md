@@ -8,11 +8,12 @@
 
 它的职责非常聚焦：
 
-- 监听技能前置读取与技能运行时 hook 上下文
+- 监听明确技能调用、技能前置读取与技能运行时 hook 上下文
 - 识别本次调用关联的 skill 是否对应某个 `SKILL.md`
 - 解析该 skill 声明的 `larkAuth`
 - 检查当前飞书应用是否已拥有所需 scope
-- 若缺 scope，则发飞书授权卡片
+- 对 `identity: user` 继续检查当前用户是否已授予所需 user scope
+- 若任一层权限缺失，则发飞书授权卡片
 - 按配置决定是否阻止本次技能继续执行
 
 不要把这个仓库往“通用权限中心”方向扩；它现在的价值恰恰在于切口小、行为清晰。
@@ -38,7 +39,7 @@
 ## 关键文件
 
 - [index.js](./index.js)
-  入口文件。注册 `before_prompt_build`、`message_received`、`before_tool_call` 三类 hook。
+  入口文件。注册 `before_prompt_build`、`message_received`、`before_agent_run`、`before_tool_call` 四类 hook。
 
 - [parse-meta.js](./parse-meta.js)
   从 `SKILL.md` frontmatter 中解析 `larkAuth`。当前是零依赖实现，兼容 JSON 内联和 YAML 缩进两种格式。
@@ -54,9 +55,9 @@
 
 ## 理解主流程的最短路径
 
-1. 看 [index.js](./index.js) 里的 `before_tool_call`
+1. 看 [index.js](./index.js) 里的 `before_agent_run` / `before_tool_call`
 2. 看 [parse-meta.js](./parse-meta.js) 里的 `readLarkAuthFromContent`
-3. 看 [utils.js](./utils.js) 里的 `checkScopes`
+3. 看 [utils.js](./utils.js) 里的 `checkScopes` / `checkUserAuthorization`
 4. 看 [utils.js](./utils.js) 里的 `sendAuthCard`
 5. 看 [utils.js](./utils.js) 里的 `startWaitForAuth`
 
@@ -90,7 +91,9 @@ const blockRead = cfg.blockRead !== false;
 
 ### 3. skill 识别仍然以绝对路径索引为主
 
-插件先扫描 skill 根目录，再把 `SKILL.md` 的绝对路径映射到 `skillName`。后续 `before_tool_call` 时，优先会把 `read` 的 path 解析成绝对路径再做匹配；如果运行时没有显式暴露 `read`，则会退回到 hook 上下文中已给出的 `skillName` / `skillCommand` / `skillsSnapshot` 来反查对应的 `SKILL.md`。
+插件先扫描 skill 根目录，同时维护路径到名称和名称到路径的解析能力。明确 skill command 会在 `before_agent_run` 中根据 OpenClaw 的标准调用提示反查 `SKILL.md`；模型自动选择 skill 时，`before_tool_call` 优先把 `read` 的 path 解析成绝对路径再匹配，并可从 `skillName` / `skillCommand` / `skillsSnapshot` 回退解析。
+
+不要用自然语言模糊匹配猜测 skill。明确命令走模型前门禁，自动选择走 `SKILL.md` 读取兜底，这两类信号都必须保持可验证、可审计。
 
 如果你改路径解析、workspace 推断或扫描深度，记得把这三部分一起看：
 

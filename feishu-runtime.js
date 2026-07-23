@@ -55,6 +55,23 @@ export function resolveOpenApiBaseUrl({ brand, domain }) {
   return "https://open.feishu.cn";
 }
 
+export function buildUserOAuthAuthorizationUrl({ appId, brand, redirectUri, scopes, state, includeOfflineAccess = true, prompt = "consent" }) {
+  if (!appId) throw new Error("missing appId");
+  if (!redirectUri) throw new Error("missing redirectUri");
+  if (!Array.isArray(scopes) || scopes.length === 0) throw new Error("no scopes");
+
+  const scopeSet = new Set(scopes.map((scope) => String(scope).trim()).filter(Boolean));
+  if (includeOfflineAccess) scopeSet.add("offline_access");
+  const url = new URL("/open-apis/authen/v1/authorize", resolveRegistrationBaseUrl(brand));
+  url.searchParams.set("client_id", appId);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("scope", [...scopeSet].join(" "));
+  if (prompt) url.searchParams.set("prompt", String(prompt));
+  if (state) url.searchParams.set("state", String(state));
+  return url.toString();
+}
+
 function encodeAddons(addons) {
   const json = JSON.stringify(addons);
   return gzipSync(Buffer.from(json, "utf8"))
@@ -64,7 +81,7 @@ function encodeAddons(addons) {
     .replace(/=+$/g, "");
 }
 
-export async function beginScopeGrantFlow({ appId, brand, scopes, source = "openclaw-skill-runtime" }) {
+export async function beginScopeGrantFlow({ appId, brand, scopes, identity = "user", source = "openclaw-skill-runtime" }) {
   if (!Array.isArray(scopes) || scopes.length === 0) {
     throw new Error("no scopes");
   }
@@ -93,6 +110,7 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
     throw new Error(payload?.error_description || payload?.error || `scope grant init failed: HTTP ${response.status}`);
   }
 
+  const scopeBucket = identity === "app" ? "tenant" : "user";
   const verificationUrl = new URL(payload.verification_uri_complete || payload.verification_uri);
   verificationUrl.searchParams.set("from", source);
   verificationUrl.searchParams.set("source", source);
@@ -100,7 +118,7 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
   verificationUrl.searchParams.set("clientID", appId);
   verificationUrl.searchParams.set("addons", encodeAddons({
     scopes: {
-      user: [...new Set(scopes)],
+      [scopeBucket]: [...new Set(scopes)],
     },
   }));
 
@@ -110,6 +128,24 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, source = "open
     deviceCode: payload.device_code || null,
     expiresIn: payload.expires_in || 600,
     interval: payload.interval || 5,
+  };
+}
+
+export async function beginUserOAuthFlow({ appId, brand, redirectUri, scopes, state, includeOfflineAccess = true, prompt = "consent" }) {
+  return {
+    verificationUrl: buildUserOAuthAuthorizationUrl({
+      appId,
+      brand,
+      redirectUri,
+      scopes,
+      state,
+      includeOfflineAccess,
+      prompt,
+    }),
+    userCode: null,
+    deviceCode: null,
+    expiresIn: null,
+    interval: null,
   };
 }
 

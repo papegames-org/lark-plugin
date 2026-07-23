@@ -1,8 +1,8 @@
 {
   "id": "openclaw-skill-runtime",
   "name": "OpenClaw Skill Runtime",
-  "version": "2.0.0",
-  "description": "读 SKILL.md 时识别 skill 并预授权其声明的飞书 scope（metadata.openclaw.larkAuth）",
+  "version": "2.0.12",
+  "description": "在明确调用或读取 SKILL.md 时识别 skill，并预授权其声明的飞书 scope（metadata.openclaw.larkAuth）",
   "main": "index.js",
   "activation": {
     "onStartup": true,
@@ -18,12 +18,54 @@
       },
       "blockRead": {
         "type": "boolean",
-        "description": "If true, block/approve read until scopes granted. Default true."
+        "description": "If true, block skill activation/read/execution until scopes are granted. Default true."
       },
       "skillRoots": {
         "type": "array",
         "items": { "type": "string" },
         "description": "Override default skill root dirs to scan."
+      },
+      "userOAuthRedirectUri": {
+        "type": "string",
+        "description": "Redirect URI used to build Feishu/Lark end-user OAuth authorization links for identity:user grants."
+      },
+      "userAuthProvider": {
+        "type": "string",
+        "enum": ["context", "lark-cli"],
+        "description": "User-identity authorization provider. lark-cli (default) uses Device Flow; context is an explicit compatibility mode that reads granted scopes from hook context profiles.",
+        "default": "lark-cli"
+      },
+      "larkCliPath": {
+        "type": "string",
+        "description": "Optional lark-cli command or absolute binary path used when userAuthProvider is lark-cli. Default lark-cli is resolved through PATH."
+      },
+      "userAuthTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 600,
+        "description": "Timeout in seconds for lark-cli device flow waiting.",
+        "default": 180
+      },
+      "toolAuth": {
+        "type": "object",
+        "description": "Optional explicit auth declarations for non-skill tool calls, keyed by OpenClaw tool name.",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "type": "string",
+              "enum": ["app", "user"],
+              "description": "Whether the tool uses app identity or user identity. Default user."
+            },
+            "scopes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Feishu/Lark scopes required before the tool call can run."
+            }
+          },
+          "required": ["scopes"]
+        }
       }
     }
   }

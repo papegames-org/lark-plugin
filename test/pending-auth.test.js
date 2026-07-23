@@ -50,6 +50,27 @@ test("bumpPendingAuthNoticeFailure increments attempts and schedules the next re
   assert.equal(bumped.status, "retrying");
 });
 
+test("pending notices retain a lark-cli command override but not profile or installer settings", () => {
+  const notice = createPendingAuthNotice({
+    authTargetKey: "acc-a::/tmp/skill-a/SKILL.md",
+    skillName: "skill-a",
+    skillPath: "/tmp/skill-a/SKILL.md",
+    accountId: "acc-a",
+    missing: ["im:message"],
+    verificationUrl: "https://approve.example/a",
+    deviceCode: "device-code",
+    userAuthProvider: "lark-cli",
+    larkCliPath: "lark-cli-custom",
+    larkCliProfile: "openclaw",
+    installLarkCliIfMissing: false,
+  }, 1000);
+
+  assert.equal(notice.userAuthProvider, "lark-cli");
+  assert.equal(notice.larkCliPath, "lark-cli-custom");
+  assert.equal("larkCliProfile" in notice, false);
+  assert.equal("installLarkCliIfMissing" in notice, false);
+});
+
 test("markPendingAuthNoticeExhausted stops retries after the max retry budget", () => {
   const exhausted = markPendingAuthNoticeExhausted({
     ...createPendingAuthNotice({

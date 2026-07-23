@@ -1,0 +1,19 @@
+{
+  "id": "papergames-approval-handler",
+  "name": "PaperGames Approval Handler",
+  "description": "Routes papergames-feishu-approve card actions to the skill script",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channels": ["feishu"],
+  "contracts": {},
+  "channelConfigs": {
+    "feishu": {
+      "schema": {
+        "type": "object"
+      }
+    }
+  }
+}

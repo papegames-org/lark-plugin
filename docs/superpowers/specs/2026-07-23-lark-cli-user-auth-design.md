@@ -42,7 +42,7 @@ scope 不存在与 scope 存在但不支持声明身份必须作为不同原因�
 
 ### 用户侧授权
 
-对于 `identity: "user"`，应用侧检查通过后，插件使用当前绑定的 lark-cli profile：
+对于 `identity: "user"`，应用侧检查通过后，插件默认使用当前绑定的 lark-cli profile。`context` 仅作为显式兼容配置保留，用于宿主已提供可读 user token profile 的场景：
 
 ```text
 lark-cli config bind --source openclaw --app-id <appId> --identity user-default

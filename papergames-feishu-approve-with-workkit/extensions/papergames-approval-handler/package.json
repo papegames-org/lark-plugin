@@ -1,0 +1,12 @@
+{
+  "name": "papergames-approval-handler",
+  "version": "1.0.0",
+  "description": "PaperGames Feishu Approval interactive card handler",
+  "main": "index.js",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "dependencies": {}
+}
