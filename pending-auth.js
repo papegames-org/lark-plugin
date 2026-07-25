@@ -39,6 +39,7 @@ function normalizeScopes(scopes) {
 
 export function createPendingAuthNotice(input, nowMs = Date.now()) {
   const missing = normalizeScopes(input?.missing);
+  const requiredScopes = normalizeScopes(input?.requiredScopes);
   const authTargetKey = normalizeString(input?.authTargetKey);
   const skillName = normalizeString(input?.skillName);
   const skillPath = normalizeString(input?.skillPath);
@@ -59,6 +60,7 @@ export function createPendingAuthNotice(input, nowMs = Date.now()) {
     identity: normalizeString(input?.identity),
     authReason: normalizeString(input?.authReason),
     missing,
+    requiredScopes: requiredScopes.length ? requiredScopes : missing,
     missingKey: normalizeString(input?.missingKey) || missing.slice().sort().join("|"),
     verificationUrl,
     userCode: normalizeString(input?.userCode),

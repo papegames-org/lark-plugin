@@ -479,9 +479,9 @@ test("before_tool_call can authorize skill runtime invocations without a read to
   assert.equal(result?.block, true);
 });
 
-test("before_tool_call sends user-grant card after user identity app scopes are open", async () => {
+test("before_tool_call sends user-grant card when app scopes are open but user grant is unverifiable", async () => {
   const handlers = new Map();
-  const captured = { sendAuthCard: [], checkUserGrant: [] };
+  const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
   const plugin = createPluginEntry({
     fileLog() {},
     logCtxSnapshotOnce() {},
@@ -501,14 +501,19 @@ test("before_tool_call sends user-grant card after user identity app scopes are 
     resolveWorkspaceDir() { return null; },
     ensureFeishuRuntimeHealth: async () => ({ ok: true }),
     checkScopes: async (_scopes, _ctx, options) => ({ ok: true, missing: [], granted: _scopes, identity: options.identity }),
-    checkUserGrant: async (openId, scopes) => {
-      captured.checkUserGrant.push({ openId, scopes });
-      return { ok: false, missing: scopes, granted: [] };
+    checkUserGrant: async (openId, scopes, _ctx, options) => {
+      captured.checkUserGrant.push({ openId, scopes, options });
+      return {
+        ok: false,
+        missing: scopes,
+        granted: [],
+        reason: options?.requireScopeDetails ? "user grant check did not include granted scope details" : "missing user grant",
+      };
     },
     startLogin: async (_missing, _ctx, options) => ({ verificationUrl: "https://example.com/user-auth", userCode: "USER", deviceCode: "DEVICE", identity: options.identity }),
     getAuthedUser: async () => ({ openId: "ou_user_grant_123" }),
     sendAuthCard: async (payload) => { captured.sendAuthCard.push(payload); return { messageId: "msg_user_grant" }; },
-    startWaitForAuth() {},
+    startWaitForAuth(payload) { captured.startWaitForAuth.push(payload); },
   });
 
   plugin.register({
@@ -522,12 +527,141 @@ test("before_tool_call sends user-grant card after user identity app scopes are 
 
   assert.equal(captured.checkUserGrant.length, 1);
   assert.equal(captured.checkUserGrant[0].openId, "ou_user_grant_123");
+  assert.equal(captured.checkUserGrant[0].options?.requireScopeDetails, true);
   assert.equal(captured.sendAuthCard.length, 1);
   assert.equal(captured.sendAuthCard[0].identity, "user");
   assert.equal(captured.sendAuthCard[0].authReason, "user_grant");
+  assert.equal(captured.startWaitForAuth.length, 1);
+  assert.equal(typeof captured.startWaitForAuth[0].onAuthorized, "function");
   assert.equal(result?.block, true);
+
+  await captured.startWaitForAuth[0].onAuthorized({
+    authTargetKey: captured.startWaitForAuth[0].authTargetKey,
+    missingKey: captured.startWaitForAuth[0].missingKey,
+    authReason: "user_grant",
+  });
+
+  const afterUserGrant = await handlers.get("before_tool_call")({ toolName: "read", params: { path: basicSkillPath } }, { channel: "feishu", accountId: "acc-a", skillCommand: { skillName: "feishu-auth-basic" } });
+  assert.equal(afterUserGrant, undefined);
 });
 
+test("before_tool_call does not resend user-grant card after background app-scope poll sends one", async () => {
+  const handlers = new Map();
+  const scopes = ["aily:data_asset:upload_file", "base:block:create"];
+  const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
+  let appScopeReady = false;
+  const plugin = createPluginEntry({
+    fileLog() {},
+    logCtxSnapshotOnce() {},
+    setApiConfigRef() {},
+    setPluginApiRef() {},
+    resetRuntimeCaches() {},
+    getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-user-grant-cooldown.json"; },
+    readPendingAuthNoticeStore() { return new Map(); },
+    writePendingAuthNoticeStore() {},
+    buildSkillRootsCacheKey() { return "test-roots"; },
+    getDefaultSkillRoots() { return []; },
+    buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-retry"]]); },
+    cachedAccountBySession: new Map(),
+    cachedWorkspaceBySession: new Map(),
+    cacheSenderId() {},
+    getCachedSenderId() { return "ou_retry_123"; },
+    resolveWorkspaceDir() { return null; },
+    readLarkAuth: () => ({ identity: "user", scopes }),
+    ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+    checkScopes: async () => appScopeReady
+      ? { ok: true, missing: [], granted: scopes, identity: "user" }
+      : { ok: false, missing: ["aily:data_asset:upload_file"], granted: ["base:block:create"], identity: "user" },
+    checkUserGrant: async (openId, requestedScopes, _ctx, options) => {
+      captured.checkUserGrant.push({ openId, scopes: requestedScopes, options });
+      return {
+        ok: false,
+        missing: requestedScopes,
+        granted: [],
+        reason: "user grant check did not include granted scope details",
+      };
+    },
+    startLogin: async (_missing, _ctx, options) => ({ verificationUrl: "https://example.com/user-auth", userCode: "USER", deviceCode: "DEVICE", identity: options.identity }),
+    getAuthedUser: async () => ({ openId: "ou_retry_123" }),
+    sendAuthCard: async (payload) => { captured.sendAuthCard.push(payload); return { messageId: `msg_${captured.sendAuthCard.length}` }; },
+    startWaitForAuth(payload) { captured.startWaitForAuth.push(payload); },
+  });
+
+  plugin.register({
+    config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+    pluginConfig: { enabled: true, blockRead: true },
+    log: { info() {}, warn() {} },
+    on(name, handler) { handlers.set(name, handler); },
+  });
+
+  const ctx = { channel: "feishu", accountId: "acc-a", skillCommand: { skillName: "feishu-auth-retry" } };
+  const event = { toolName: "read", params: { path: basicSkillPath } };
+
+  const first = await handlers.get("before_tool_call")(event, ctx);
+  assert.equal(first?.block, true);
+  assert.equal(captured.sendAuthCard.length, 1);
+  assert.equal(captured.sendAuthCard[0].authReason, "app_scope");
+  assert.equal(captured.startWaitForAuth.length, 1);
+
+  appScopeReady = true;
+  await captured.startWaitForAuth[0].onAuthCardSent({
+    authTargetKey: captured.startWaitForAuth[0].authTargetKey,
+    missingKey: scopes.slice().sort().join("|"),
+    authReason: "user_grant",
+  });
+
+  const second = await handlers.get("before_tool_call")(event, ctx);
+  assert.equal(second?.block, true);
+  assert.equal(captured.sendAuthCard.length, 1);
+});
+test("before_tool_call allows user identity skill when user grant scopes are verified", async () => {
+  const handlers = new Map();
+  const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
+  const plugin = createPluginEntry({
+    fileLog() {},
+    logCtxSnapshotOnce() {},
+    setApiConfigRef() {},
+    setPluginApiRef() {},
+    resetRuntimeCaches() {},
+    getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-user-grant-verified.json"; },
+    readPendingAuthNoticeStore() { return new Map(); },
+    writePendingAuthNoticeStore() {},
+    buildSkillRootsCacheKey() { return "test-roots"; },
+    getDefaultSkillRoots() { return []; },
+    buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-basic"]]); },
+    cachedAccountBySession: new Map(),
+    cachedWorkspaceBySession: new Map(),
+    cacheSenderId() {},
+    getCachedSenderId() { return "ou_user_verified_123"; },
+    resolveWorkspaceDir() { return null; },
+    ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+    checkScopes: async (scopes, _ctx, options) => ({ ok: true, missing: [], granted: scopes, identity: options.identity }),
+    checkUserGrant: async (openId, scopes, _ctx, options) => {
+      captured.checkUserGrant.push({ openId, scopes, options });
+      return { ok: true, missing: [], granted: scopes, hasScopeDetails: true };
+    },
+    startLogin: async () => { throw new Error("verified user grant must not start login"); },
+    getAuthedUser: async () => ({ openId: "ou_user_verified_123" }),
+    sendAuthCard: async (payload) => { captured.sendAuthCard.push(payload); return { messageId: "msg_should_not_send" }; },
+    startWaitForAuth(payload) { captured.startWaitForAuth.push(payload); },
+  });
+
+  plugin.register({
+    config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+    pluginConfig: { enabled: true, blockRead: true },
+    log: { info() {}, warn() {} },
+    on(name, handler) { handlers.set(name, handler); },
+  });
+
+  const result = await handlers.get("before_tool_call")({ toolName: "read", params: { path: basicSkillPath } }, { channel: "feishu", accountId: "acc-a", skillCommand: { skillName: "feishu-auth-basic" } });
+
+  assert.equal(captured.checkUserGrant.length, 1);
+  assert.equal(captured.checkUserGrant[0].openId, "ou_user_verified_123");
+  assert.equal(captured.checkUserGrant[0].options?.requireScopeDetails, true);
+  assert.equal(captured.sendAuthCard.length, 0);
+  assert.equal(captured.startWaitForAuth.length, 0);
+  assert.equal(result, undefined);
+});
 test("before_tool_call allows app identity skill when app identity scopes are open", async () => {
   const handlers = new Map();
   const captured = { sendAuthCard: [], checkScopes: [] };

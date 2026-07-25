@@ -275,6 +275,25 @@ export function createPluginEntry(overrides = {}) {
       }
     }
 
+    function markSkillAuthCardSent({ authTargetKey, missingKey, authReason }) {
+      if (!authTargetKey || !missingKey) return;
+      skillAuthCache.set(authTargetKey, {
+        missingKey,
+        lastSentAtMs: Date.now(),
+        authReason,
+      });
+    }
+
+    function markSkillAuthAuthorized({ authTargetKey, missingKey, authReason }) {
+      if (!authTargetKey || authReason !== "user_grant") return;
+      skillAuthCache.set(authTargetKey, {
+        missingKey,
+        lastSentAtMs: Date.now(),
+        authorized: true,
+        authReason,
+      });
+      clearPendingAuthNotice(authTargetKey);
+    }
     function updatePendingAuthNotice(authTargetKey, updates = {}) {
       const notice = pendingAuthNotices.get(authTargetKey);
       if (!notice) return null;
@@ -354,9 +373,13 @@ export function createPluginEntry(overrides = {}) {
           missingKey: notice.missingKey,
           openId: notice.openId,
           scopes: notice.missing,
+          requiredScopes: notice.requiredScopes || notice.missing,
           identity: notice.identity,
           authReason: notice.authReason,
           ctx: { accountId: notice.accountId },
+          authMessageId: sent.messageId,
+          onAuthorized: markSkillAuthAuthorized,
+          onAuthCardSent: markSkillAuthCardSent,
         });
         return { ok: true, messageId: sent.messageId };
       }
@@ -547,16 +570,30 @@ export function createPluginEntry(overrides = {}) {
         }
 
         if (appScopeCheck.ok && identity === "user") {
+          const fullMissingKey = larkAuth.scopes.slice().sort().join("|");
+          const completedCache = skillAuthCache.get(authTargetKey);
           resolvedUser = await getAuthedUser(ctx).catch(() => null);
-          const userGrantCheck = await checkUserGrant(resolvedUser?.openId, larkAuth.scopes, ctx);
+          fileLog(`skill="${skillName}" app scopes are open; checking user grant with scope details`);
+          const userGrantCheck = await checkUserGrant(resolvedUser?.openId, larkAuth.scopes, ctx, { requireScopeDetails: true });
           if (userGrantCheck.ok) {
             clearPendingAuthNotice(authTargetKey);
-            skillAuthCache.delete(authTargetKey);
+            skillAuthCache.set(authTargetKey, {
+              missingKey: fullMissingKey,
+              lastSentAtMs: Date.now(),
+              authorized: true,
+              authReason: "user_grant",
+            });
+            fileLog(`skill="${skillName}" user grant already authorized with scope details`);
+            return;
+          }
+          if (completedCache?.authorized === true && completedCache?.authReason === "user_grant" && completedCache?.missingKey === fullMissingKey) {
+            clearPendingAuthNotice(authTargetKey);
+            fileLog(`skill="${skillName}" user grant allowed by recent plugin authorization marker`);
             return;
           }
           authReason = "user_grant";
           missing = userGrantCheck.missing?.length ? userGrantCheck.missing : larkAuth.scopes;
-          fileLog(`skill="${skillName}" user grant missing: ${missing.join(", ")} reason=${userGrantCheck.reason || "not granted"}`);
+          fileLog(`skill="${skillName}" user grant missing or unverifiable: ${missing.join(", ")} reason=${userGrantCheck.reason || "not granted"}`);
         } else {
           missing = missing.length ? missing : larkAuth.scopes;
           fileLog(`skill="${skillName}" app ${identity} scopes missing: ${missing.join(", ")}`);
@@ -597,7 +634,7 @@ export function createPluginEntry(overrides = {}) {
         }
 
         const cache = skillAuthCache.get(authTargetKey);
-        const missingKey = missing.slice().sort().join("|");
+        const missingKey = (authReason === "user_grant" ? larkAuth.scopes : missing).slice().sort().join("|");
         if (cache) {
           fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
         }
@@ -606,6 +643,7 @@ export function createPluginEntry(overrides = {}) {
           return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;
         }
 
+        let loginError = null;
         const login = await startLogin(missing, ctx, { identity, authReason });
         if (login.verificationUrl) {
           const user = resolvedUser || await getAuthedUser(ctx);
@@ -623,7 +661,7 @@ export function createPluginEntry(overrides = {}) {
             skillAuthCache.set(authTargetKey, { missingKey, lastSentAtMs: now });
             const mode = blockRead ? "(blocked)" : "";
             fileLog(`auth card ${mode} "${skillName}" sent msg=${sent.messageId}`);
-            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, identity, authReason, ctx });
+            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, requiredScopes: larkAuth.scopes, identity, authReason, ctx, authMessageId: sent.messageId, onAuthorized: markSkillAuthAuthorized, onAuthCardSent: markSkillAuthCardSent });
           } else {
             fileLog(`sendAuthCard failed: ${sent.error}`);
             const notice = recordPendingAuthFailure({
@@ -633,6 +671,7 @@ export function createPluginEntry(overrides = {}) {
               accountId: resolvedAccountId,
               openId: user?.openId || null,
               missing,
+              requiredScopes: larkAuth.scopes,
               missingKey,
               verificationUrl: login.verificationUrl,
               userCode: login.userCode,
@@ -644,11 +683,18 @@ export function createPluginEntry(overrides = {}) {
             if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
           }
         } else {
-          fileLog(`startLogin failed "${skillName}": ${login.error}`);
+          loginError = login?.error || "startLogin failed";
+          fileLog(`startLogin failed "${skillName}": ${loginError}`);
         }
         // 无论发卡是否成功，只要 blockRead=true 且 scopes 缺失，一律拦截 read，
         // 防止模型拿到 SKILL.md 内容后绕过授权直接执行 skill。
         if (blockRead) {
+          if (loginError) {
+            return {
+              block: true,
+              reason: `Skill "${skillName}" requires Feishu authorization, but the authorization runtime is not ready: ${loginError}`,
+            };
+          }
           const reason = pendingAuthNotices.has(authTargetKey)
             ? `技能「${skillName}」需要飞书权限授权，授权提醒发送失败，系统会自动重试，请稍后重试。`
             : `技能「${skillName}」需要飞书权限授权，已发送授权卡片，请先完成授权后重试。`;
