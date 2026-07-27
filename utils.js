@@ -369,6 +369,31 @@ function summarizeCommandResult(result) {
   return detail || `exit=${result?.code ?? "unknown"}`;
 }
 
+const LARK_CLI_REQUIRED_MESSAGE = "lark-cli is required for identity=user authorization. Install @larksuite/cli, ensure the gateway PATH can find lark-cli, run `lark-cli config bind --source openclaw --identity user-default`, then restart gateway.";
+
+function isLarkCliMissingResult(result) {
+  const parts = [
+    result?.code,
+    result?.error?.code,
+    result?.error?.message,
+    result?.stderr,
+    result?.stdout,
+  ].map((part) => String(part || ""));
+  return parts.some((part) => /\bENOENT\b|not found|command not found/i.test(part));
+}
+
+async function checkLarkCliRuntimeReady() {
+  const result = await runLarkCli(["--version"], { timeoutMs: 10000 });
+  if (result?.ok || (result?.code === 0 && !result?.error)) {
+    return { ok: true, version: String(result.stdout || result.stderr || "").trim() };
+  }
+  const detail = summarizeCommandResult(result);
+  const error = isLarkCliMissingResult(result)
+    ? `lark-cli not found in gateway PATH. ${LARK_CLI_REQUIRED_MESSAGE}`
+    : `lark-cli runtime check failed: ${detail}. ${LARK_CLI_REQUIRED_MESSAGE}`;
+  return { ok: false, error, detail };
+}
+
 function spawnLarkCliDeviceWait(deviceCode) {
   const code = String(deviceCode || "").trim();
   if (!code) return { error: "no deviceCode" };
@@ -389,17 +414,35 @@ function spawnLarkCliDeviceWait(deviceCode) {
   }
 }
 
-async function checkUserGrantViaLarkCli(scopes) {
+async function checkUserGrantViaLarkCli(scopes, options = {}) {
+  const health = await checkLarkCliRuntimeReady();
+  if (!health.ok) {
+    const failed = {
+      ok: false,
+      missing: scopes,
+      granted: [],
+      unavailable: true,
+      source: "lark-cli",
+      reason: health.error,
+      precondition: "lark-cli",
+    };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
+    return failed;
+  }
   const result = await runLarkCli(
     ["auth", "check", "--json", "--scope", scopes.join(" ")],
     { timeoutMs: 30000 },
   );
   const payload = extractJsonPayload(result.stdout, result.stderr);
   if (payload) {
-    const normalized = normalizeGrantCheckResult(payload, scopes);
-    if (normalized) return { ...normalized, source: "lark-cli" };
+    const normalized = normalizeGrantCheckResult(payload, scopes, options);
+    if (normalized) {
+      const withSource = { ...normalized, source: "lark-cli" };
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(withSource, options)}`);
+      return withSource;
+    }
   }
-  return {
+  const fallback = {
     ok: false,
     missing: scopes,
     granted: [],
@@ -407,9 +450,15 @@ async function checkUserGrantViaLarkCli(scopes) {
     source: "lark-cli",
     reason: summarizeCommandResult(result),
   };
+  fileLog(`checkUserGrant result ${formatGrantCheckForLog(fallback, options)}`);
+  return fallback;
 }
 
 async function startUserGrantLogin(scopes) {
+  const health = await checkLarkCliRuntimeReady();
+  if (!health.ok) {
+    return { error: health.error, precondition: "lark-cli" };
+  }
   const result = await runLarkCli(
     ["auth", "login", "--scope", scopes.join(" "), "--no-wait", "--json"],
     { timeoutMs: 30000 },
@@ -738,28 +787,85 @@ export async function getAuthedUser(ctx) {
   const openId = getCachedSenderId(ctx) || null;
   return openId ? { openId } : null;
 }
-function normalizeGrantCheckResult(response, requestedScopes) {
+function normalizeGrantCheckResult(response, requestedScopes, options = {}) {
   if (!response) return null;
   const source = response.data && typeof response.data === "object" ? response.data : response;
-  const grantedScopes = source.grantedScopes || source.granted_scopes || source.scopes || source.scope || [];
+  const acceptEmptyMissing = options.acceptEmptyMissing === true;
+  const requireScopeDetails = options.requireScopeDetails === true;
+  const grantedScopes =
+    source.grantedScopes ||
+    source.granted_scopes ||
+    (Array.isArray(source.granted) ? source.granted : null) ||
+    source.scopes ||
+    source.scope ||
+    [];
+  const hasMissingField = Object.prototype.hasOwnProperty.call(source, "missingScopes") ||
+    Object.prototype.hasOwnProperty.call(source, "missing_scopes") ||
+    Object.prototype.hasOwnProperty.call(source, "missing");
   const missingScopes = source.missingScopes || source.missing_scopes || source.missing || [];
   const granted = Array.isArray(grantedScopes)
-    ? grantedScopes.map(String)
+    ? grantedScopes.map(String).filter(Boolean)
     : String(grantedScopes || "").split(/[\s,]+/u).filter(Boolean);
   const explicitMissing = Array.isArray(missingScopes)
-    ? missingScopes.map(String)
+    ? missingScopes.map(String).filter(Boolean)
     : String(missingScopes || "").split(/[\s,]+/u).filter(Boolean);
   const grantedSet = new Set(granted);
+  const hasScopeDetails = granted.length > 0;
+  const positiveResult = source.ok === true || source.authorized === true || source.granted === true;
+  const acceptedEmptyMissing = acceptEmptyMissing && hasMissingField && positiveResult && explicitMissing.length === 0 && !requireScopeDetails;
   const missing = explicitMissing.length
     ? explicitMissing
-    : requestedScopes.filter((scope) => !grantedSet.has(scope));
-  const ok = source.ok === true || source.authorized === true || source.granted === true || missing.length === 0;
-  return { ok, granted: requestedScopes.filter((scope) => !missing.includes(scope)), missing };
+    : granted.length
+      ? requestedScopes.filter((scope) => !grantedSet.has(scope))
+      : acceptedEmptyMissing
+        ? []
+        : requestedScopes;
+  const ok = missing.length === 0 && (hasScopeDetails || acceptedEmptyMissing);
+  const result = {
+    ok,
+    granted: ok && !hasScopeDetails ? requestedScopes : requestedScopes.filter((scope) => !missing.includes(scope)),
+    missing,
+    hasScopeDetails,
+  };
+  if (!ok && requireScopeDetails && !hasScopeDetails) {
+    result.reason = "user grant check did not include granted scope details";
+  } else if (!ok && source.ok === true && granted.length === 0 && !hasMissingField) {
+    result.reason = "user grant check did not include scope details";
+  }
+  return result;
 }
-
-export async function checkUserGrant(openId, scopes, ctx) {
-  if (!scopes?.length) return { ok: true, missing: [], granted: [] };
-  if (!openId) return { ok: false, missing: scopes, granted: [], unavailable: true, reason: "no openId" };
+function formatGrantCheckForLog(result, options = {}) {
+  const payload = {
+    ok: result?.ok === true,
+    missing: Array.isArray(result?.missing) ? result.missing : [],
+    granted: Array.isArray(result?.granted) ? result.granted : [],
+    hasScopeDetails: result?.hasScopeDetails === true,
+    source: result?.source || null,
+    reason: result?.reason || null,
+    unavailable: result?.unavailable === true,
+    precondition: result?.precondition || null,
+    options: {
+      requireScopeDetails: options?.requireScopeDetails === true,
+      acceptEmptyMissing: options?.acceptEmptyMissing === true,
+    },
+  };
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload);
+  }
+}
+export async function checkUserGrant(openId, scopes, ctx, options = {}) {
+  if (!scopes?.length) {
+    const empty = { ok: true, missing: [], granted: [], hasScopeDetails: true, source: "empty-scopes" };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(empty, options)}`);
+    return empty;
+  }
+  if (!openId) {
+    const failed = { ok: false, missing: scopes, granted: [], unavailable: true, reason: "no openId", source: "runtime" };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
+    return failed;
+  }
   const tools = pluginApiRef?.tools || {};
   const checker =
     tools.openclaw_lark_check_user_grant ||
@@ -767,7 +873,7 @@ export async function checkUserGrant(openId, scopes, ctx) {
     tools.lark_auth_check_user_grant ||
     null;
   if (!checker) {
-    return await checkUserGrantViaLarkCli(scopes);
+    return await checkUserGrantViaLarkCli(scopes, options);
   }
   try {
     const appId = await getAppId(ctx).catch(() => null);
@@ -777,13 +883,16 @@ export async function checkUserGrant(openId, scopes, ctx) {
       accountId: getAccountId(ctx),
       appId,
     });
-    const normalized = normalizeGrantCheckResult(response, scopes);
-    if (normalized) return normalized;
+    const normalized = normalizeGrantCheckResult(response, scopes, options);
+    if (normalized) {
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog({ ...normalized, source: "runtime-checker" }, options)}`);
+      return normalized;
+    }
     fileLog(`checkUserGrant: checker response unparseable; falling back to lark-cli`);
-    return await checkUserGrantViaLarkCli(scopes);
+    return await checkUserGrantViaLarkCli(scopes, options);
   } catch (error) {
     fileLog(`checkUserGrant: failed: ${formatError(error)}; falling back to lark-cli`);
-    return await checkUserGrantViaLarkCli(scopes);
+    return await checkUserGrantViaLarkCli(scopes, options);
   }
 }
 
@@ -883,6 +992,117 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
   }
 }
 
+async function updateInteractiveCard(messageId, card, ctx = {}) {
+  const mid = String(messageId || "").trim();
+  if (!mid || mid === "sent") return { error: "no messageId" };
+  if (pluginApiRef?.tools?.feishu_im_user_message) {
+    try {
+      const response = await pluginApiRef.tools.feishu_im_user_message({
+        action: "update",
+        message_id: mid,
+        msg_type: "interactive",
+        content: JSON.stringify(card),
+      });
+      if (response?.success || response?.code === 0 || response?.data) return { messageId: mid };
+      fileLog(`updateInteractiveCard: plugin tool update failed: ${formatFeishuApiResponseError(response)}`);
+    } catch (error) {
+      fileLog(`updateInteractiveCard: plugin tool update failed: ${formatError(error)}`);
+    }
+  }
+  try {
+    const response = await callFeishuOpenApi(await getAccountCredentials(ctx), {
+      method: "PATCH",
+      path: `/open-apis/im/v1/messages/${encodeURIComponent(mid)}`,
+      body: { content: JSON.stringify(card) },
+    });
+    if (response?.code === 0 || response?.data) return { messageId: mid };
+    return { error: formatFeishuApiResponseError(response) };
+  } catch (error) {
+    return { error: formatError(error) };
+  }
+}
+
+function buildAuthStageDoneCard({ skillName, authReason = "app_scope", userGrantComplete = false }) {
+  const isUserGrant = authReason === "user_grant";
+  const title = isUserGrant ? "飞书用户授权已完成" : "飞书应用权限已开通";
+  const subtitle = isUserGrant
+    ? `技能 “${skillName}” 已完成用户身份授权`
+    : userGrantComplete
+      ? `技能 “${skillName}” 已完成应用权限开通和用户授权`
+      : `技能 “${skillName}” 已完成应用权限开通`;
+  const content = isUserGrant
+    ? `技能 **${skillName}** 的用户授权已完成。`
+    : userGrantComplete
+      ? `技能 **${skillName}** 的应用权限已开通，当前用户授权也已完成。`
+      : `技能 **${skillName}** 的应用权限已开通，继续进行用户授权。`;
+  const statusText = isUserGrant
+    ? "<font color='green'>✅ 用户授权完成</font>"
+    : userGrantComplete
+      ? "<font color='green'>✅ 应用权限开通完成，用户授权已完成</font>"
+      : "<font color='green'>✅ 应用权限开通完成</font>";
+  return {
+    schema: "2.0",
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      template: "green",
+      title: { tag: "plain_text", content: title },
+      subtitle: { tag: "plain_text", content: subtitle },
+      text_tag_list: LARK_AUTH_CARD_HEADER_TAGS,
+      icon: { tag: "standard_icon", token: "check_outlined" },
+    },
+    body: {
+      elements: [
+        { tag: "markdown", content },
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          background_style: "default",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: statusText }],
+            },
+            {
+              tag: "column",
+              width: "auto",
+              vertical_align: "center",
+              elements: [
+                {
+                  tag: "img",
+                  img_key: LARK_AUTH_CARD_FOOTER_IMAGE_KEY,
+                  alt: { tag: "plain_text", content: "Paper" },
+                  scale_type: "crop_center",
+                  size: "80px 24px",
+                  transparent: true,
+                  preview: false,
+                  margin: "0 0 0 8px",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+async function updateAuthStageCard({ messageId, skillName, authReason, accountId, userGrantComplete = false }) {
+  if (!messageId || messageId === "sent") return { error: "no messageId" };
+  const result = await updateInteractiveCard(
+    messageId,
+    buildAuthStageDoneCard({ skillName, authReason, userGrantComplete }),
+    { accountId },
+  );
+  if (result?.messageId) {
+    fileLog(`auth card updated skill="${skillName}" authReason=${authReason} userGrantComplete=${userGrantComplete} msg=${messageId}`);
+  } else if (result?.error) {
+    fileLog(`auth card update failed skill="${skillName}" authReason=${authReason}: ${result.error}`);
+  }
+  return result;
+}
 async function sendAuthSuccessCard({ skillName, openId, accountId }) {
   const doneCard = {
     schema: "2.0",
@@ -913,11 +1133,15 @@ export function startWaitForAuth({
   missingKey,
   openId,
   scopes,
+  requiredScopes = null,
   identity = "user",
   authReason = "app_scope",
   ctx,
+  authMessageId = null,
+  onAuthorized = null,
+  onAuthCardSent = null,
 }) {
-  if (!deviceCode) return;
+  if (!deviceCode && authReason === "user_grant") return;
   // 如果该技能已有轮询在跑，先清理旧的，避免重复
   const pollingKey = authTargetKey || skillName;
   const existing = activePollingIntervals.get(pollingKey);
@@ -928,7 +1152,7 @@ export function startWaitForAuth({
   }
 
   fileLog(
-    `waitForAuth: starting for "${skillName}" deviceCode=${deviceCode.slice(0, 12)}...`,
+    `waitForAuth: starting for "${skillName}" deviceCode=${deviceCode ? `${deviceCode.slice(0, 12)}...` : "<none>"}`,
   );
   const t0 = Date.now();
   // 轮询间隔 15 秒（用户手动授权通常需要更长时间，无需高频请求）
@@ -970,13 +1194,118 @@ export function startWaitForAuth({
 
       const normalizedIdentity = normalizeAuthIdentity(identity);
       const check = authReason === "user_grant"
-        ? await checkUserGrant(openId, scopes, ctx)
+        ? await checkUserGrant(openId, scopes, ctx, { acceptEmptyMissing: true })
         : await checkScopes(scopes, ctx, { identity: normalizedIdentity });
+      if (authReason === "user_grant") {
+        fileLog(`waitForAuth: "${skillName}" user grant poll result ${formatGrantCheckForLog(check, { acceptEmptyMissing: true })}`);
+      }
       if (check?.ok) {
+        if (authMessageId) {
+          await updateAuthStageCard({
+            messageId: authMessageId,
+            skillName,
+            authReason,
+            accountId: ctx?.accountId || ctx?.account,
+          });
+        }
+        if (normalizedIdentity === "user" && authReason !== "user_grant") {
+          const userRequiredScopes = Array.isArray(requiredScopes) && requiredScopes.length ? requiredScopes : scopes;
+          const userGrantCheck = await checkUserGrant(openId, userRequiredScopes, ctx, { requireScopeDetails: true });
+          fileLog(`waitForAuth: "${skillName}" user grant precheck result ${formatGrantCheckForLog(userGrantCheck, { requireScopeDetails: true })}`);
+          if (userGrantCheck.ok) {
+            fileLog(
+              `waitForAuth: "${skillName}" app scope authorized and user grant verified with scope details`,
+            );
+          } else {
+            const userGrantMissing = userGrantCheck.missing?.length ? userGrantCheck.missing : userRequiredScopes;
+            fileLog(
+              `waitForAuth: "${skillName}" app scope authorized, user grant missing or unverifiable: ${userGrantMissing.join(", ")} reason=${userGrantCheck.reason || "not granted"}`,
+            );
+            const login = await startLogin(userGrantMissing, ctx, {
+              identity: "user",
+              authReason: "user_grant",
+            });
+          if (login?.verificationUrl) {
+            const sent = await sendAuthCard({
+              skillName,
+              missing: userGrantMissing,
+              ...login,
+              openId,
+              accountId: ctx?.accountId || ctx?.account,
+              identity: "user",
+              authReason: "user_grant",
+            });
+            if (sent?.messageId) {
+              cleanup();
+              fileLog(
+                `waitForAuth: "${skillName}" app scope authorized; user grant card sent msg=${sent.messageId}`,
+              );
+              if (typeof onAuthCardSent === "function") {
+                try {
+                  await onAuthCardSent({
+                    authTargetKey,
+                    skillName,
+                    missingKey: userRequiredScopes.slice().sort().join("|"),
+                    openId,
+                    scopes: userGrantMissing,
+                    requiredScopes: userRequiredScopes,
+                    identity: "user",
+                    authReason: "user_grant",
+                    messageId: sent.messageId,
+                    ctx,
+                  });
+                } catch (callbackError) {
+                  fileLog(`waitForAuth: onAuthCardSent callback failed for "${skillName}": ${callbackError?.message || callbackError}`);
+                }
+              }
+              startWaitForAuth({
+                authTargetKey,
+                skillName,
+                deviceCode: login.deviceCode,
+                missingKey: userRequiredScopes.slice().sort().join("|"),
+                openId,
+                scopes: userGrantMissing,
+                requiredScopes: userRequiredScopes,
+                identity: "user",
+                authReason: "user_grant",
+                ctx,
+                authMessageId: sent.messageId,
+                onAuthorized,
+                onAuthCardSent,
+              });
+              return;
+            }
+            fileLog(
+              `waitForAuth: "${skillName}" user grant card failed after app scope authorization: ${sent?.error || "send failed"}`,
+            );
+            return;
+          }
+            fileLog(
+              `waitForAuth: "${skillName}" start user grant after app scope authorization failed: ${login?.error || "unknown error"}`,
+            );
+            return;
+          }
+        }
         cleanup();
         fileLog(
           `waitForAuth: "${skillName}" authorized! identity=${normalizedIdentity} authReason=${authReason} (${Math.round(elapsed / 1000)}s)`,
         );
+        if (typeof onAuthorized === "function") {
+          try {
+            await onAuthorized({
+              authTargetKey,
+              skillName,
+              missingKey,
+              openId,
+              scopes,
+              identity: normalizedIdentity,
+              authReason,
+              ctx,
+            });
+          } catch (callbackError) {
+            fileLog(`waitForAuth: onAuthorized callback failed for "${skillName}": ${callbackError?.message || callbackError}`);
+          }
+        }
         if (openId) {
           const sent = await sendAuthSuccessCard({
             skillName,
