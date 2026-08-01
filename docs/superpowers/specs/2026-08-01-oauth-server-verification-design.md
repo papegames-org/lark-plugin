@@ -57,13 +57,21 @@ CLI profile 是共享凭据。若当前 account appId 或入站用户 openId 无
 
 `tokenStatus: valid`、token 过期时间以及 `auth check` 的结果都不作为 OAuth 服务端有效性的证据。插件先解析完整的 status JSON：已识别的 `missing` 或明确服务端拒绝 token 即使 CLI 非零退出也按相应授权路径处理；未知 `verify_failed` 原因、超时、部分或畸形 JSON，以及没有可分类完整状态的命令失败，一律归为 `oauth_runtime_unavailable`，而不是重新授权。
 
+### 飞书授权卡片与 Device Flow
+
+本改造复用现有 `sendAuthCard`、卡片按钮、消息更新及 `startWaitForAuth` 链路，不把 Device Flow URL 裸露到 Skill 阻断文本。
+
+当分类为 `oauth_reauth_required` 或 `scope_missing` 时，插件通过现有飞书卡片发出授权交互；卡片按钮启动/打开由 `startLogin` 产生的 Device Flow 链接。`oauth_reauth_required` 的卡片文案明确说明“当前 OAuth 授权已失效，需要重新授权”；`scope_missing` 则说明“当前授权缺少所需权限”。
+
+卡片发送失败仍沿用 `pendingAuthNotices` 的持久化退避重试机制。`oauth_runtime_unavailable` 绝不发送卡片，以免网络、CLI 配置或 keychain 故障被错误提示为用户需授权。
+
 ### Runtime checker 兼容
 
 现有 OpenClaw runtime checker 仅当它同时明确返回服务端用户 token 验证证据（例如 `serverVerified: true`）、完整 granted scope 详情、及与请求参数相符的 `openId` 和 `appId` 时可放行；否则无论它是不存在、调用失败还是只有本地 scope 结果，都使用上面的 CLI fallback。这样本地/陈旧 checker 不会绕过已撤销 OAuth token，也不会跨用户或跨应用放行。
 
 ### 授权轮询
 
-Device Flow 完成后的轮询也走同一验证入口。因此 device waiter 成功退出，或本地 CLI 已写入 token，都不代表授权完成；只有新的服务端验证、身份匹配及完整 scope 验证成功才完成。`oauth_runtime_unavailable` 在轮询中保持阻断并更新诊断，不转换为授权卡片。
+Device Flow 完成后的轮询也走同一验证入口。因此 device waiter 成功退出，或本地 CLI 已写入 token，都不代表授权完成；只有新的服务端验证、身份匹配及完整 scope 验证成功才将现有卡片更新为“授权完成”。`oauth_runtime_unavailable` 在轮询中保持阻断并更新诊断，不转换为授权卡片。
 
 ## 测试
 
@@ -78,3 +86,4 @@ Device Flow 完成后的轮询也走同一验证入口。因此 device waiter �
 7. 含 profile 配置时精确调用 `--profile <name> auth status --verify`，未配置时不伪造 `--profile openclaw`，且 OAuth 路径绝不调用 `auth check`；
 8. runtime checker 的 `serverVerified` / scope 成功但 appId 或 openId 不匹配时不得放行；
 9. device waiter 成功退出但新的 `status --verify` 未通过时，轮询不得完成授权。
+10. 重新授权和补充 scope 均复用现有飞书授权卡片与 `pendingAuthNotices`；运行时不可用时不发卡。
