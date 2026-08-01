@@ -40,9 +40,9 @@ Run: `node --test test/utils.test.js --test-name-pattern "server-verified CLI us
 
 Expected: FAIL because the implementation still invokes `auth check` and cannot interpret `identities.user`.
 
-- [ ] **Step 3: Implement minimal normalized CLI status result**
+- [ ] **Step 3: Implement minimal normalized CLI status result and context plumbing**
 
-Replace `checkUserGrantViaLarkCli`'s `auth check` call with `auth status --verify`.
+Replace `checkUserGrantViaLarkCli`'s `auth check` call with `auth status --verify`. Change its signature to receive the requester `openId` and `ctx`, and thread both from every fallback call site so it can resolve and compare the selected account appId before returning a positive result.
 
 Add small pure helpers near it:
 
@@ -67,10 +67,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit the focused change**
 
-```bash
-git add utils.js test/utils.test.js
-git commit -m "feat: verify user OAuth with lark-cli status"
-```
+Use `git diff -- utils.js test/utils.test.js` to identify only task-owned hunks. This worktree is already dirty; do not stage an entire shared file without confirming unrelated changes are excluded.
 
 ### Task 2: Classify revoked, missing, mismatched, and unavailable OAuth states
 
@@ -83,9 +80,10 @@ git commit -m "feat: verify user OAuth with lark-cli status"
 Cover these exact outcomes:
 
 ```js
-// Explicit revocation: classified for reauthorization.
-{ identities: { user: { status: "verify_failed", available: false,
-  verified: false, message: "server rejected token: [20005] invalid access token" } } }
+// Explicit revocation with a bound profile: classified for reauthorization.
+{ appId: "cli_app", identities: { user: { status: "verify_failed", available: false,
+  verified: false, openId: "ou_requester",
+  message: "server rejected token: [20005] invalid access token" } } }
 // First-time user: classified for reauthorization when app + requester are known.
 { appId: "cli_app", identities: { user: { status: "missing", available: false } } }
 // A bot may be verified, but user failure never passes.
@@ -132,10 +130,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit the classification change**
 
-```bash
-git add utils.js test/utils.test.js
-git commit -m "feat: classify verified OAuth failures"
-```
+Use reviewed hunk staging only (`git add -p`) if a commit is requested; never stage unrelated pre-existing edits.
 
 ### Task 3: Harden the runtime-checker fast path
 
@@ -145,7 +140,7 @@ git commit -m "feat: classify verified OAuth failures"
 
 - [ ] **Step 1: Write failing tests for checker attestation**
 
-Test that checker `{ ok: true, granted: requested }` falls back to CLI because it lacks `serverVerified: true`. Test that a checker with `serverVerified: true` but a mismatched returned `openId` or `appId` also does not pass. Test a matching checker with `serverVerified: true`, matching identity/app and complete grants passes without CLI.
+Test that checker `{ ok: true, granted: requested }` falls back to CLI because it lacks `serverVerified: true`. Test that a checker with `serverVerified: true` but a mismatched returned `openId` or `appId` also does not pass. Test a matching checker with `serverVerified: true`, matching identity/app and complete grants passes without CLI. Also test a matching server-verified checker whose grant list omits a requested scope: it must return normalized `scope_missing`, not discard a known server-side negative result.
 
 - [ ] **Step 2: Run focused tests and verify they fail**
 
@@ -170,10 +165,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit the checker hardening**
 
-```bash
-git add utils.js test/utils.test.js
-git commit -m "fix: require server proof from user grant checker"
-```
+Use reviewed hunk staging only (`git add -p`) if a commit is requested; never stage unrelated pre-existing edits.
 
 ### Task 4: Integrate OAuth states with read blocking and card start
 
@@ -189,6 +181,8 @@ Add tests where a user-identity Skill receives `checkUserGrant` results with the
 - `oauth_reauth_required` sends the existing authorization card and starts login with **all** `larkAuth.scopes`;
 - `scope_missing` may display only the missing list but calls `startLogin(larkAuth.scopes, ...)`;
 - `oauth_runtime_unavailable` blocks with diagnostic reason and never calls `startLogin`, `sendAuthCard`, or pending-notice retry.
+
+Add card-payload assertions: `oauth_reauth_required` renders a reauthorization reason, `scope_missing` renders a missing-permission reason, and the subtype is retained in a pending notice.
 
 - [ ] **Step 2: Run the focused integration tests and verify they fail**
 
@@ -213,10 +207,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit the hook integration**
 
-```bash
-git add index.js test/index.test.js
-git commit -m "feat: route OAuth failures through authorization cards"
-```
+Use reviewed hunk staging only (`git add -p`) if a commit is requested; never stage unrelated pre-existing edits.
 
 ### Task 5: Revalidate card polling and persistent retries
 
@@ -263,10 +254,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Commit retry and polling hardening**
 
-```bash
-git add utils.js index.js test/utils.test.js test/index.test.js
-git commit -m "fix: revalidate OAuth before card retries"
-```
+Use reviewed hunk staging only (`git add -p`) if a commit is requested; never stage unrelated pre-existing edits.
 
 ### Task 6: Update user documentation and run release checks
 
@@ -299,9 +287,4 @@ Expected: all commands exit 0.
 
 Run: `git diff --check && git status --short`
 
-Then commit only files owned by this work:
-
-```bash
-git add README.md utils.js index.js test/utils.test.js test/index.test.js
-git commit -m "docs: explain verified OAuth authorization"
-```
+If a commit is requested, use `git diff` and `git add -p` to stage only task-owned hunks. Do not stage whole shared files because the worktree had pre-existing modifications.
