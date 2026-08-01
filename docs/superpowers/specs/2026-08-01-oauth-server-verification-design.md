@@ -23,10 +23,12 @@
 当 OpenClaw runtime checker 不存在、抛错或返回不可用结果时，插件执行：
 
 ```text
-lark-cli [--profile <configured-profile>] auth status --verify --json
+lark-cli [--profile <configured-profile>] auth status --verify
 ```
 
 其中 `--profile` 仅在 `OPENCLAW_SKILL_RUNTIME_LARK_PROFILE` 或 `LARK_PROFILE_NAME` 明确配置时附加；插件不假定 profile 名为 `openclaw`。
+
+当前官方 CLI 的 `auth status` 默认输出 JSON，且不接受 `--json` flag；命令参数必须精确保持如上。
 
 CLI 的 JSON 输出解析 `identities.user`，而绝不使用顶层 `identity` / `verified`：顶层字段可能表示仍可用的 bot 身份。
 
@@ -36,36 +38,42 @@ CLI 的 JSON 输出解析 `identities.user`，而绝不使用顶层 `identity` /
 
 1. `identities.user.available === true`；
 2. `identities.user.verified === true`；
-3. `identities.user.scope` 被拆分为完整 scope 集合后，涵盖请求的全部 scope。
+3. 输出顶层 `appId` 与当前 OpenClaw account 的 appId 匹配；
+4. `identities.user.openId` 与当前入站用户 openId 匹配；
+5. `identities.user.scope` 被拆分为完整 scope 集合后，涵盖请求的全部 scope。
 
-`scope` 使用空白字符分隔。缺失项为请求 scope 与该集合的差集。
+`scope` 使用空白字符分隔，并在比较前去空、去重。缺失项为请求 scope 与该集合的差集。
+
+CLI profile 是共享凭据。若 appId、用户 openId 无法取得或不匹配，插件必须 fail closed 并归类为 `oauth_runtime_unavailable`，不得向该共享 profile 发卡或发起登录。此 fallback 因此只支持单用户 Gateway 或由运行时保证每个请求者有独立 profile 的部署；多用户共享 profile 不属于安全支持的配置。
 
 ### 失败分类
 
 | 类别 | 判定 | 行为 |
 | --- | --- | --- |
-| `oauth_reauth_required` | user `missing`、`verify_failed`，或服务端拒绝 token（例如 `20005 invalid access token`） | 阻断并发送授权卡片；Device Flow 请求该 Skill 的全部必需 scope。 |
-| `scope_missing` | user 已服务端验证，但 token scope 缺失部分 scope | 阻断并发送授权卡片；仅请求缺失 scope。 |
+| `oauth_reauth_required` | 已解析的 user `missing`，或 `verify_failed` 且明确表明服务端拒绝 token（例如 `20005 invalid access token`） | 阻断并发送授权卡片；Device Flow 请求该 Skill 的全部必需 scope。 |
+| `scope_missing` | user 已服务端验证，但 token scope 缺失部分 scope | 阻断并发送授权卡片；Device Flow 至少请求该 Skill 的全部必需 scope，不能只请求差集。 |
 | `oauth_runtime_unavailable` | CLI 缺失、profile/config/keychain 不可用、网络失败、超时或 JSON 不可解析 | 安全阻断；不发送授权卡片，返回可诊断的运行时错误。 |
 | `authorized` | 通过全部放行条件 | 放行。 |
 
-`tokenStatus: valid`、token 过期时间以及 `auth check` 的结果都不作为 OAuth 服务端有效性的证据。
+`tokenStatus: valid`、token 过期时间以及 `auth check` 的结果都不作为 OAuth 服务端有效性的证据。未知 `verify_failed` 原因、非零退出、超时、部分或畸形 JSON，一律归为 `oauth_runtime_unavailable`，而不是重新授权。
 
 ### Runtime checker 兼容
 
-现有 OpenClaw runtime checker 继续优先使用；只有它不存在、调用失败或返回无法可靠判定 scope 的结果时，才使用上面的 CLI fallback。Runtime checker 的可信成功结果保持兼容，以免在部署 lark-cli 前破坏已有运行时集成。
+现有 OpenClaw runtime checker 仅当它同时明确返回服务端用户 token 验证证据（例如 `serverVerified: true`）和完整 granted scope 详情时可放行；否则无论它是不存在、调用失败还是只有本地 scope 结果，都使用上面的 CLI fallback。这样本地/陈旧 checker 不会绕过已撤销 OAuth token。
 
 ### 授权轮询
 
-Device Flow 完成后的轮询也走同一验证入口。因此本地 CLI 已写入 token、但飞书服务端未接受 token 时，轮询不会把授权标记为成功。
+Device Flow 完成后的轮询也走同一验证入口。因此 device waiter 成功退出，或本地 CLI 已写入 token，都不代表授权完成；只有新的服务端验证、身份匹配及完整 scope 验证成功才完成。`oauth_runtime_unavailable` 在轮询中保持阻断并更新诊断，不转换为授权卡片。
 
 ## 测试
 
 新增单元测试覆盖：
 
-1. 服务端验证成功且 scope 完整时放行；
+1. 服务端验证成功、应用/用户匹配且 scope 完整时放行；
 2. 本地 `tokenStatus: valid` 但 `verified: false` / `20005` 时拒绝并触发重新授权；
-3. 服务端验证成功但 scope 缺失时仅返回缺失 scope；
+3. 服务端验证成功但 scope 缺失时返回缺失 scope，且 login 请求完整 Skill scope；
 4. 顶层 `verified: true` 且 user `verified: false` 时仍拒绝；
-5. CLI / 配置 / keychain / 网络 / 无法解析输出时标记运行时不可用，且不被当成 scope 缺失；
-6. 含 profile 配置时命令参数正确，未配置时不伪造 `--profile openclaw`。
+5. CLI / 配置 / keychain / 网络 / 无法解析输出时标记运行时不可用，不发卡、不启动 login；
+6. CLI 返回 appId 或 openId 与当前 account / 请求用户不匹配时安全阻断；
+7. 含 profile 配置时精确调用 `--profile <name> auth status --verify`，未配置时不伪造 `--profile openclaw`，且 OAuth 路径绝不调用 `auth check`；
+8. device waiter 成功退出但新的 `status --verify` 未通过时，轮询不得完成授权。
