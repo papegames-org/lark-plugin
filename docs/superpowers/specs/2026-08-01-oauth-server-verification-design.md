@@ -63,7 +63,9 @@ CLI profile 是共享凭据。若当前 account appId 或入站用户 openId 无
 
 当分类为 `oauth_reauth_required` 或 `scope_missing` 时，插件通过现有飞书卡片发出授权交互；卡片按钮启动/打开由 `startLogin` 产生的 Device Flow 链接。`oauth_reauth_required` 的卡片文案明确说明“当前 OAuth 授权已失效，需要重新授权”；`scope_missing` 则说明“当前授权缺少所需权限”。
 
-卡片发送失败仍沿用 `pendingAuthNotices` 的持久化退避重试机制。`oauth_runtime_unavailable` 绝不发送卡片，以免网络、CLI 配置或 keychain 故障被错误提示为用户需授权。
+授权状态（重新授权或缺少 scope）必须作为卡片 subtype 贯穿 `startLogin`、`sendAuthCard`、轮询及 pending notice，供卡片展示准确原因。
+
+卡片发送失败仍沿用 `pendingAuthNotices` 的持久化退避重试机制，但每次重试/recovery 发卡前必须重新执行完整的 OAuth 分类：已授权时清除 notice 与 gate；运行时不可用、应用不匹配或用户不匹配时清除/停用 notice 且不发卡；仍需要授权时再生成有效的 Device Flow 并发送新卡。不得重发持久化的旧 Device Flow URL。`oauth_runtime_unavailable` 绝不发送卡片，以免网络、CLI 配置或 keychain 故障被错误提示为用户需授权。
 
 ### Runtime checker 兼容
 
@@ -71,7 +73,7 @@ CLI profile 是共享凭据。若当前 account appId 或入站用户 openId 无
 
 ### 授权轮询
 
-Device Flow 完成后的轮询也走同一验证入口。因此 device waiter 成功退出，或本地 CLI 已写入 token，都不代表授权完成；只有新的服务端验证、身份匹配及完整 scope 验证成功才将现有卡片更新为“授权完成”。`oauth_runtime_unavailable` 在轮询中保持阻断并更新诊断，不转换为授权卡片。
+Device Flow 完成后的轮询也走同一验证入口。因此 device waiter 成功退出，或本地 CLI 已写入 token，都不代表授权完成；只有新的服务端验证、身份匹配及完整 Skill scope 验证成功才将现有卡片更新为“授权完成”。卡片可以只展示缺失 scope，但轮询与授权 marker 必须验证 `requiredScopes`（完整 Skill scope），不能只验证初始缺失差集。`oauth_runtime_unavailable` 在轮询中保持阻断并更新诊断，不转换为授权卡片或“已取消”。
 
 ## 测试
 
@@ -87,3 +89,5 @@ Device Flow 完成后的轮询也走同一验证入口。因此 device waiter �
 8. runtime checker 的 `serverVerified` / scope 成功但 appId 或 openId 不匹配时不得放行；
 9. device waiter 成功退出但新的 `status --verify` 未通过时，轮询不得完成授权。
 10. 重新授权和补充 scope 均复用现有飞书授权卡片与 `pendingAuthNotices`；运行时不可用时不发卡。
+11. `A+B` 是 Skill 全量 scope、`B` 是初始差集时，登录/轮询只得到 `B` 不得写入 authorized marker 或绕过后续读取；
+12. pending notice 重试前状态转为已授权、运行时不可用或身份不匹配时，分别清除、停用、或阻断，均不得发出过期授权卡。
