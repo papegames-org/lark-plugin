@@ -49,12 +49,18 @@ export function setPluginApiRef(val) {
 export function resetRuntimeCaches() {
   runtimeHealthCache = null;
   appScopesCache.clear();
+  larkCliProfileByAppId.clear();
 }
 
 // ---------- 日志 ----------
 
 export function fileLog(msg) {
-  console.log(`[openclaw-skill-runtime] ${new Date().toISOString()} ${msg}`);
+  const redacted = String(msg)
+    .replace(/(["'](?:auth[_-]?url|verification[_-]?(?:url|uri(?:[_-]?complete)?)|user[_-]?code|device[_-]?code|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|app[_-]?secret|receive[_-]?id|open[_-]?id|sender[_-]?id)["']\s*:\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}\]]+)/giu, "$1\"<redacted>\"")
+    .replace(/\b(auth[_-]?url|verification[_-]?(?:url|uri(?:[_-]?complete)?)|user[_-]?code|device[_-]?code|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|app[_-]?secret|receive[_-]?id|open[_-]?id|sender[_-]?id)=\S+/giu, "$1=<redacted>")
+    .replace(/https?:\/\/[^\s"']+/giu, "<redacted>")
+    .replace(/\b(?:ou|oc)_[A-Za-z0-9_-]+\b/gu, "<redacted>");
+  console.log(`[openclaw-skill-runtime] ${new Date().toISOString()} ${redacted}`);
 }
 
 export function logCtxSnapshotOnce(ctx) {
@@ -147,12 +153,66 @@ export function inferSenderIdFromCtx(ctx) {
     ctx?.senderId,
     ctx?.senderOpenId,
     ctx?.openId,
+    ctx?.sender?.sender_id?.open_id,
+    ctx?.sender?.senderId?.openId,
+    ctx?.sender?.open_id,
     ctx?.channelId,
   ];
   for (const value of candidates) {
-    if (typeof value === "string" && /^ou_[A-Za-z0-9]/.test(value.trim())) {
-      return value.trim();
-    }
+    const target = normalizeAuthCardTarget(value);
+    if (target?.receiveIdType === "open_id") return target.receiveId;
+  }
+  return null;
+}
+
+function normalizeAuthCardTarget(value) {
+  let normalized = String(value || "").trim();
+  if (!normalized) return null;
+  while (/^(?:feishu|lark):/i.test(normalized)) {
+    normalized = normalized.replace(/^(?:feishu|lark):/i, "").trim();
+  }
+  normalized = normalized.replace(/^(?:chat|chat_id|group|channel|open_id|user|dm|p2p):/i, "").trim();
+  normalized = normalized.split(/:(?:topic|sender):/i, 1)[0].trim();
+  if (/^(?:ou_|on_)[A-Za-z0-9]/.test(normalized)) {
+    return { receiveId: normalized, receiveIdType: "open_id" };
+  }
+  if (/^oc_[A-Za-z0-9]/.test(normalized)) {
+    return { receiveId: normalized, receiveIdType: "chat_id" };
+  }
+  return null;
+}
+
+export function resolveAuthCardRecipient(ctx = {}) {
+  const openIdCandidates = [
+    ctx?.senderId,
+    ctx?.senderOpenId,
+    ctx?.openId,
+    ctx?.sender?.sender_id?.open_id,
+    ctx?.sender?.senderId?.openId,
+    ctx?.sender?.open_id,
+    ctx?.sender?.id,
+    process.env.OPENCLAW_SENDER_ID,
+    process.env.SENDER_ID,
+  ];
+  for (const value of openIdCandidates) {
+    const target = normalizeAuthCardTarget(value);
+    if (target?.receiveIdType === "open_id") return target;
+  }
+  const cached = getCachedSenderId(ctx);
+  if (cached) return { receiveId: cached, receiveIdType: "open_id" };
+
+  const chatIdCandidates = [
+    ctx?.chatId,
+    ctx?.chat?.id,
+    ctx?.chat_id,
+    ctx?.channelId,
+    process.env.OPENCLAW_CHAT_ID,
+    process.env.OPENCLAW_INBOUND_CHAT_ID,
+    process.env.CHAT_ID,
+  ];
+  for (const value of chatIdCandidates) {
+    const target = normalizeAuthCardTarget(value);
+    if (target?.receiveIdType === "chat_id") return target;
   }
   return null;
 }
@@ -275,6 +335,16 @@ function formatFeishuApiResponseError(response) {
   }
 }
 
+function isFeishuMutationSuccessful(response) {
+  const code = response?.code;
+  // Feishu OpenAPI always supplies code. When it is present, it must win over
+  // any partial data object returned alongside an error response.
+  if (code !== undefined && code !== null) return Number(code) === 0;
+  // The OpenClaw message tool may omit code and only expose a success flag or
+  // result data, so retain that compatibility for code-less tool responses.
+  return response?.success === true || Boolean(response?.data);
+}
+
 function formatError(error) {
   if (!error) return "unknown error";
   const parts = [];
@@ -297,6 +367,7 @@ function formatError(error) {
 
 let larkCliCommandRunnerForTest = null;
 let larkCliDeviceWaitSpawnerForTest = null;
+const larkCliProfileByAppId = new Map();
 
 export function setLarkCliCommandRunnerForTest(runner) {
   larkCliCommandRunnerForTest = typeof runner === "function" ? runner : null;
@@ -306,17 +377,23 @@ export function setLarkCliDeviceWaitSpawnerForTest(spawner) {
   larkCliDeviceWaitSpawnerForTest = typeof spawner === "function" ? spawner : null;
 }
 
-function getLarkCliBaseArgs() {
-  const profile = String(
+function getConfiguredLarkCliProfile() {
+  return String(
     process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE ||
       process.env.LARK_PROFILE_NAME ||
       "",
   ).trim();
+}
+
+function getLarkCliBaseArgs(profileOverride = undefined) {
+  const profile = profileOverride === undefined
+    ? getConfiguredLarkCliProfile()
+    : String(profileOverride || "").trim();
   return profile ? ["--profile", profile] : [];
 }
 
 function runLarkCli(args, options = {}) {
-  const fullArgs = [...getLarkCliBaseArgs(), ...args];
+  const fullArgs = [...getLarkCliBaseArgs(options.profile), ...args];
   if (larkCliCommandRunnerForTest) {
     return Promise.resolve(larkCliCommandRunnerForTest(fullArgs, options));
   }
@@ -370,6 +447,7 @@ function summarizeCommandResult(result) {
 }
 
 const LARK_CLI_REQUIRED_MESSAGE = "lark-cli is required for identity=user authorization. Install @larksuite/cli, ensure the gateway PATH can find lark-cli, run `lark-cli config bind --source openclaw --identity user-default`, then restart gateway.";
+const LARK_CLI_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function isLarkCliMissingResult(result) {
   const parts = [
@@ -382,8 +460,8 @@ function isLarkCliMissingResult(result) {
   return parts.some((part) => /\bENOENT\b|not found|command not found/i.test(part));
 }
 
-async function checkLarkCliRuntimeReady() {
-  const result = await runLarkCli(["--version"], { timeoutMs: 10000 });
+async function checkLarkCliRuntimeReady(profile = undefined) {
+  const result = await runLarkCli(["--version"], { timeoutMs: 10000, profile });
   if (result?.ok || (result?.code === 0 && !result?.error)) {
     return { ok: true, version: String(result.stdout || result.stderr || "").trim() };
   }
@@ -394,10 +472,54 @@ async function checkLarkCliRuntimeReady() {
   return { ok: false, error, detail };
 }
 
-function spawnLarkCliDeviceWait(deviceCode) {
+function extractJsonArray(...texts) {
+  for (const text of texts) {
+    const raw = String(text || "").trim();
+    if (!raw) continue;
+    const candidates = [raw, ...raw.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean).reverse()];
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed?.profiles)) return parsed.profiles;
+        if (Array.isArray(parsed?.data?.profiles)) return parsed.data.profiles;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+async function resolveLarkCliProfile(ctx = {}) {
+  const configured = getConfiguredLarkCliProfile();
+  if (configured) return { resolved: true, profile: configured, source: "env" };
+
+  const appId = await getAppId(ctx).catch(() => null);
+  if (!appId) return { resolved: true, profile: null, source: "default" };
+  const cached = larkCliProfileByAppId.get(appId);
+  if (cached && (Date.now() - cached.resolvedAtMs) < LARK_CLI_PROFILE_CACHE_TTL_MS) {
+    return { resolved: true, profile: cached.profile, source: "cache" };
+  }
+
+  const listed = await runLarkCli(["profile", "list"], { timeoutMs: 10000, profile: null });
+  const profiles = extractJsonArray(listed.stdout, listed.stderr);
+  if (!listed?.ok && !(listed?.code === 0 && !listed?.error)) {
+    return { error: `lark-cli profile list failed: ${summarizeCommandResult(listed)}` };
+  }
+  const match = profiles?.find((item) =>
+    String(item?.appId || item?.app_id || "").trim() === String(appId).trim() &&
+    String(item?.name || "").trim(),
+  );
+  const profile = String(match?.name || "").trim();
+  if (!profile) return { error: `no lark-cli profile matches OpenClaw appId=${appId}` };
+  larkCliProfileByAppId.set(appId, { profile, resolvedAtMs: Date.now() });
+  fileLog(`lark-cli profile resolved appId=${appId} profile=${profile}`);
+  return { resolved: true, profile, source: "profile-list" };
+}
+
+function spawnLarkCliDeviceWait(deviceCode, profile = undefined) {
   const code = String(deviceCode || "").trim();
   if (!code) return { error: "no deviceCode" };
-  const fullArgs = [...getLarkCliBaseArgs(), "auth", "login", "--device-code", code];
+  const fullArgs = [...getLarkCliBaseArgs(profile), "auth", "login", "--device-code", code];
   if (larkCliDeviceWaitSpawnerForTest) {
     return larkCliDeviceWaitSpawnerForTest(fullArgs) || { started: true };
   }
@@ -407,14 +529,64 @@ function spawnLarkCliDeviceWait(deviceCode) {
       stdio: "ignore",
       windowsHide: true,
     });
+    const waiter = { started: true, pid: child.pid || null, exited: false, exitCode: null, signal: null };
+    child.once("exit", (code, signal) => {
+      waiter.exited = true;
+      waiter.exitCode = code;
+      waiter.signal = signal;
+    });
     child.unref();
-    return { started: true, pid: child.pid || null };
+    waiter.cancel = () => {
+      if (waiter.exited || waiter.cancelled) return;
+      waiter.cancelled = true;
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGTERM");
+        else child.kill("SIGTERM");
+      } catch {
+        try { child.kill("SIGTERM"); } catch {}
+      }
+    };
+    return waiter;
   } catch (error) {
     return { error: formatError(error) };
   }
 }
 
-async function checkUserGrantViaLarkCli(scopes, options = {}) {
+function getStatusString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isExplicitInvalidAccessTokenStatus(payload, userIdentity) {
+  if (getStatusString(userIdentity?.status).toLowerCase() !== "verify_failed" || userIdentity?.verified !== false) {
+    return false;
+  }
+  const errorCode = String(payload?.error?.code || payload?.code || "").trim();
+  const message = [payload?.message, payload?.error?.message, payload?.error_description]
+    .map(getStatusString)
+    .filter(Boolean)
+    .join("\n");
+  return errorCode === "20005" || /\[20005\]/u.test(message);
+}
+
+function isReauthRequiredLarkCliStatus(payload, expectedAppId, openId) {
+  const userIdentity = payload?.identities?.user;
+  const status = getStatusString(userIdentity?.status).toLowerCase();
+  const appMatches =
+    Boolean(expectedAppId) &&
+    getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId);
+  const requesterMatches = Boolean(openId) && (
+    getStatusString(userIdentity?.openId || userIdentity?.open_id) === getStatusString(openId) ||
+    (status === "missing" && userIdentity?.available === false && !getStatusString(userIdentity?.openId || userIdentity?.open_id))
+  );
+  if (!appMatches || !requesterMatches) return false;
+
+  const isMissingUser =
+    status === "missing" &&
+    userIdentity?.available === false;
+  return isMissingUser || isExplicitInvalidAccessTokenStatus(payload, userIdentity);
+}
+
+async function checkUserGrantViaLarkCli(openId, scopes, ctx = {}, options = {}) {
   const health = await checkLarkCliRuntimeReady();
   if (!health.ok) {
     const failed = {
@@ -423,21 +595,84 @@ async function checkUserGrantViaLarkCli(scopes, options = {}) {
       granted: [],
       unavailable: true,
       source: "lark-cli",
+      oauthState: "oauth_runtime_unavailable",
       reason: health.error,
       precondition: "lark-cli",
     };
     fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
     return failed;
   }
-  const result = await runLarkCli(
-    ["auth", "check", "--json", "--scope", scopes.join(" ")],
-    { timeoutMs: 30000 },
+  const expectedAppId = await getAppId(ctx).catch(() => null);
+  const configuredProfile = getConfiguredLarkCliProfile();
+  const cachedProfile = !configuredProfile && expectedAppId
+    ? larkCliProfileByAppId.get(expectedAppId)
+    : null;
+  let profile = configuredProfile || cachedProfile?.profile || null;
+  let result = await runLarkCli(
+    ["auth", "status", "--verify"],
+    { timeoutMs: 30000, profile },
   );
-  const payload = extractJsonPayload(result.stdout, result.stderr);
-  if (payload) {
-    const normalized = normalizeGrantCheckResult(payload, scopes, options);
+  let payload = extractJsonPayload(result.stdout, result.stderr);
+  let userIdentity = payload?.identities?.user;
+  const defaultProfileMatchesApp =
+    !configuredProfile &&
+    String(payload?.appId || payload?.app_id || "").trim() === String(expectedAppId || "").trim();
+  if (defaultProfileMatchesApp && expectedAppId) {
+    larkCliProfileByAppId.set(expectedAppId, { profile: null, resolvedAtMs: Date.now() });
+  }
+  if (!configuredProfile && !profile && !defaultProfileMatchesApp) {
+    const profileResolution = await resolveLarkCliProfile(ctx);
+    if (!profileResolution.resolved) {
+      const failed = {
+        ok: false,
+        missing: scopes,
+        granted: [],
+        unavailable: true,
+        source: "lark-cli",
+        oauthState: "oauth_runtime_unavailable",
+        reason: profileResolution.error || "lark-cli profile unavailable",
+        precondition: "lark-cli-profile",
+      };
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
+      return failed;
+    }
+    profile = profileResolution.profile;
+    result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
+    payload = extractJsonPayload(result.stdout, result.stderr);
+    userIdentity = payload?.identities?.user;
+  }
+  if (isReauthRequiredLarkCliStatus(payload, expectedAppId, openId)) {
+    const reauthRequired = {
+      ok: false,
+      missing: scopes,
+      granted: [],
+      source: "lark-cli-status",
+      oauthState: "oauth_reauth_required",
+      reason: summarizeCommandResult(result),
+    };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(reauthRequired, options)}`);
+    return reauthRequired;
+  }
+  const commandSucceeded = result?.ok === true || (result?.code === 0 && !result?.error);
+  const statusMatchesRequester =
+    commandSucceeded &&
+    Boolean(expectedAppId) &&
+    String(payload?.appId || payload?.app_id || "").trim() === String(expectedAppId).trim() &&
+    String(userIdentity?.openId || userIdentity?.open_id || "").trim() === String(openId || "").trim() &&
+    userIdentity?.available === true &&
+    userIdentity?.verified === true;
+  if (statusMatchesRequester) {
+    const normalized = normalizeGrantCheckResult(
+      { scope: userIdentity.scope || userIdentity.scopes || [] },
+      scopes,
+      options,
+    );
     if (normalized) {
-      const withSource = { ...normalized, source: "lark-cli" };
+      const withSource = {
+        ...normalized,
+        source: "lark-cli-status",
+        oauthState: normalized.ok ? "authorized" : "scope_missing",
+      };
       fileLog(`checkUserGrant result ${formatGrantCheckForLog(withSource, options)}`);
       return withSource;
     }
@@ -448,20 +683,25 @@ async function checkUserGrantViaLarkCli(scopes, options = {}) {
     granted: [],
     unavailable: true,
     source: "lark-cli",
+    oauthState: "oauth_runtime_unavailable",
     reason: summarizeCommandResult(result),
   };
   fileLog(`checkUserGrant result ${formatGrantCheckForLog(fallback, options)}`);
   return fallback;
 }
 
-async function startUserGrantLogin(scopes) {
-  const health = await checkLarkCliRuntimeReady();
+async function startUserGrantLogin(scopes, ctx = {}) {
+  const profileResolution = await resolveLarkCliProfile(ctx);
+  if (!profileResolution.resolved) {
+    return { error: profileResolution.error || "lark-cli profile unavailable", precondition: "lark-cli-profile" };
+  }
+  const health = await checkLarkCliRuntimeReady(profileResolution.profile);
   if (!health.ok) {
     return { error: health.error, precondition: "lark-cli" };
   }
   const result = await runLarkCli(
     ["auth", "login", "--scope", scopes.join(" "), "--no-wait", "--json"],
-    { timeoutMs: 30000 },
+    { timeoutMs: 30000, profile: profileResolution.profile },
   );
   const payload = extractJsonPayload(result.stdout, result.stderr);
   const verificationUrl = String(
@@ -476,7 +716,7 @@ async function startUserGrantLogin(scopes) {
   if (!verificationUrl || !deviceCode) {
     return { error: summarizeCommandResult(result) };
   }
-  const waiter = spawnLarkCliDeviceWait(deviceCode);
+  const waiter = spawnLarkCliDeviceWait(deviceCode, profileResolution.profile);
   if (waiter?.error) {
     fileLog(`startLogin: lark-cli device waiter failed: ${waiter.error}`);
   } else {
@@ -489,6 +729,7 @@ async function startUserGrantLogin(scopes) {
     expiresIn: Number(payload?.expires_in || payload?.expiresIn || 600) || 600,
     interval: Number(payload?.interval || 5) || 5,
     provider: "lark-cli",
+    authWaiter: waiter?.error ? null : waiter,
   };
 }
 export function normalizeAuthIdentity(identity) {
@@ -768,7 +1009,7 @@ export async function startLogin(missing, ctx, options = {}) {
   try {
     const authReason = String(options.authReason || "app_scope").trim();
     if (authReason === "user_grant") {
-      return await startUserGrantLogin(missing);
+      return await startUserGrantLogin(missing, ctx);
     }
     const credentials = await getAccountCredentials(ctx);
     return await beginScopeGrantFlow({
@@ -810,7 +1051,7 @@ function normalizeGrantCheckResult(response, requestedScopes, options = {}) {
     ? missingScopes.map(String).filter(Boolean)
     : String(missingScopes || "").split(/[\s,]+/u).filter(Boolean);
   const grantedSet = new Set(granted);
-  const hasScopeDetails = granted.length > 0;
+  const hasScopeDetails = granted.length > 0 || explicitMissing.length > 0;
   const positiveResult = source.ok === true || source.authorized === true || source.granted === true;
   const acceptedEmptyMissing = acceptEmptyMissing && hasMissingField && positiveResult && explicitMissing.length === 0 && !requireScopeDetails;
   const missing = explicitMissing.length
@@ -834,6 +1075,22 @@ function normalizeGrantCheckResult(response, requestedScopes, options = {}) {
   }
   return result;
 }
+
+function getRuntimeCheckerResponseData(response) {
+  return response?.data && typeof response.data === "object" ? response.data : response;
+}
+
+function hasTrustedRuntimeGrantAttestation(response, expectedAppId, expectedOpenId) {
+  const source = getRuntimeCheckerResponseData(response);
+  const receivedAppId = String(source?.appId || source?.app_id || "").trim();
+  const receivedOpenId = String(source?.openId || source?.open_id || "").trim();
+  return source?.serverVerified === true &&
+    Boolean(expectedAppId) &&
+    Boolean(expectedOpenId) &&
+    receivedAppId === String(expectedAppId).trim() &&
+    receivedOpenId === String(expectedOpenId).trim();
+}
+
 function formatGrantCheckForLog(result, options = {}) {
   const payload = {
     ok: result?.ok === true,
@@ -844,6 +1101,7 @@ function formatGrantCheckForLog(result, options = {}) {
     reason: result?.reason || null,
     unavailable: result?.unavailable === true,
     precondition: result?.precondition || null,
+    oauthState: result?.oauthState || null,
     options: {
       requireScopeDetails: options?.requireScopeDetails === true,
       acceptEmptyMissing: options?.acceptEmptyMissing === true,
@@ -862,7 +1120,15 @@ export async function checkUserGrant(openId, scopes, ctx, options = {}) {
     return empty;
   }
   if (!openId) {
-    const failed = { ok: false, missing: scopes, granted: [], unavailable: true, reason: "no openId", source: "runtime" };
+    const failed = {
+      ok: false,
+      missing: scopes,
+      granted: [],
+      unavailable: true,
+      oauthState: "oauth_runtime_unavailable",
+      reason: "no openId",
+      source: "runtime",
+    };
     fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
     return failed;
   }
@@ -873,7 +1139,7 @@ export async function checkUserGrant(openId, scopes, ctx, options = {}) {
     tools.lark_auth_check_user_grant ||
     null;
   if (!checker) {
-    return await checkUserGrantViaLarkCli(scopes, options);
+    return await checkUserGrantViaLarkCli(openId, scopes, ctx, options);
   }
   try {
     const appId = await getAppId(ctx).catch(() => null);
@@ -884,15 +1150,20 @@ export async function checkUserGrant(openId, scopes, ctx, options = {}) {
       appId,
     });
     const normalized = normalizeGrantCheckResult(response, scopes, options);
-    if (normalized) {
-      fileLog(`checkUserGrant result ${formatGrantCheckForLog({ ...normalized, source: "runtime-checker" }, options)}`);
-      return normalized;
+    if (normalized?.hasScopeDetails && hasTrustedRuntimeGrantAttestation(response, appId, openId)) {
+      const verified = {
+        ...normalized,
+        source: "runtime-checker",
+        oauthState: normalized.ok ? "authorized" : "scope_missing",
+      };
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(verified, options)}`);
+      return verified;
     }
-    fileLog(`checkUserGrant: checker response unparseable; falling back to lark-cli`);
-    return await checkUserGrantViaLarkCli(scopes, options);
+    fileLog(`checkUserGrant: checker response lacks trusted server attestation or scope details; falling back to lark-cli`);
+    return await checkUserGrantViaLarkCli(openId, scopes, ctx, options);
   } catch (error) {
     fileLog(`checkUserGrant: failed: ${formatError(error)}; falling back to lark-cli`);
-    return await checkUserGrantViaLarkCli(scopes, options);
+    return await checkUserGrantViaLarkCli(openId, scopes, ctx, options);
   }
 }
 
@@ -942,15 +1213,27 @@ export function sidebarApplink(authUrl) {
 /** 按 skillName 去重的轮询定时器，防止同一技能创建多个轮询 */
 const activePollingIntervals = new Map();
 
-async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
-  if (!openId) return { error: "no openId" };
+function cancelAuthWaiter(waiter) {
+  if (!waiter || waiter.exited || waiter.cancelled) return;
+  try {
+    if (typeof waiter.cancel === "function") waiter.cancel();
+    else if (typeof waiter.kill === "function") waiter.kill("SIGTERM");
+    else if (typeof waiter.child?.kill === "function") waiter.child.kill("SIGTERM");
+    waiter.cancelled = true;
+  } catch (error) {
+    fileLog(`waitForAuth: device waiter cancellation failed: ${error?.message || error}`);
+  }
+}
+
+async function sendInteractiveCard(receiveId, receiveIdType, card, timeoutMs = 20000, ctx = {}) {
+  if (!receiveId) return { error: "no receiveId" };
   if (pluginApiRef?.tools?.feishu_im_user_message) {
-    fileLog(`sendInteractiveCard: using plugin tool for openId=${openId}`);
+    fileLog(`sendInteractiveCard: using plugin tool receiveId=${receiveId} receiveIdType=${receiveIdType}`);
     try {
       const response = await pluginApiRef.tools.feishu_im_user_message({
         action: "send",
-        receive_id: openId,
-        receive_id_type: "open_id",
+        receive_id: receiveId,
+        receive_id_type: receiveIdType,
         msg_type: "interactive",
         content: JSON.stringify(card),
       });
@@ -966,20 +1249,20 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
     }
   } else {
     fileLog(
-      `sendInteractiveCard: plugin tool unavailable, falling back to HTTP openId=${openId}`,
+      `sendInteractiveCard: plugin tool unavailable, falling back to HTTP receiveId=${receiveId} receiveIdType=${receiveIdType}`,
     );
   }
   const credentials = await getAccountCredentials(ctx);
   try {
     fileLog(
-      `sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} openId=${openId}`,
+      `sendInteractiveCard: using HTTP fallback accountId=${credentials.accountId} receiveId=${receiveId} receiveIdType=${receiveIdType}`,
     );
     const response = await callFeishuOpenApi(credentials, {
       method: "POST",
       path: "/open-apis/im/v1/messages",
-      params: { receive_id_type: "open_id" },
+      params: { receive_id_type: receiveIdType },
       body: {
-        receive_id: openId,
+        receive_id: receiveId,
         msg_type: "interactive",
         content: JSON.stringify(card),
       },
@@ -992,7 +1275,7 @@ async function sendInteractiveCard(openId, card, timeoutMs = 20000, ctx = {}) {
   }
 }
 
-async function updateInteractiveCard(messageId, card, ctx = {}) {
+export async function updateInteractiveCard(messageId, card, ctx = {}) {
   const mid = String(messageId || "").trim();
   if (!mid || mid === "sent") return { error: "no messageId" };
   if (pluginApiRef?.tools?.feishu_im_user_message) {
@@ -1003,7 +1286,7 @@ async function updateInteractiveCard(messageId, card, ctx = {}) {
         msg_type: "interactive",
         content: JSON.stringify(card),
       });
-      if (response?.success || response?.code === 0 || response?.data) return { messageId: mid };
+      if (isFeishuMutationSuccessful(response)) return { messageId: mid };
       fileLog(`updateInteractiveCard: plugin tool update failed: ${formatFeishuApiResponseError(response)}`);
     } catch (error) {
       fileLog(`updateInteractiveCard: plugin tool update failed: ${formatError(error)}`);
@@ -1015,7 +1298,7 @@ async function updateInteractiveCard(messageId, card, ctx = {}) {
       path: `/open-apis/im/v1/messages/${encodeURIComponent(mid)}`,
       body: { content: JSON.stringify(card) },
     });
-    if (response?.code === 0 || response?.data) return { messageId: mid };
+    if (isFeishuMutationSuccessful(response)) return { messageId: mid };
     return { error: formatFeishuApiResponseError(response) };
   } catch (error) {
     return { error: formatError(error) };
@@ -1089,6 +1372,76 @@ function buildAuthStageDoneCard({ skillName, authReason = "app_scope", userGrant
   };
 }
 
+function buildAuthStageFailureCard({ skillName, state, authReason = "user_grant" }) {
+  const timedOut = state === "timeout";
+  const runtimeUnavailable = state === "oauth_runtime_unavailable";
+  const appScope = authReason === "app_scope";
+  const subject = appScope ? "飞书应用权限开通" : "飞书用户授权";
+  const title = runtimeUnavailable
+    ? "飞书用户授权运行时不可用"
+    : timedOut ? `${subject}超时` : "飞书用户授权未完成";
+  const subtitle = runtimeUnavailable
+    ? `技能 “${skillName}” 的用户授权运行时当前不可用`
+    : timedOut
+      ? `技能 “${skillName}” 的${appScope ? "应用权限开通" : "用户授权"}已超时`
+      : `技能 “${skillName}” 的用户授权已取消或未完成`;
+  const content = runtimeUnavailable
+    ? "授权运行时当前不可用，请检查 OAuth 运行时后重试。"
+    : timedOut
+      ? `${appScope ? "应用权限开通" : "授权"}超时，请重新触发技能后再次授权。`
+      : "授权被取消或未成功完成，请重新触发技能后再次授权。";
+  const statusText = timedOut
+    ? "<font color='orange'>⏱ 授权超时</font>"
+    : runtimeUnavailable
+      ? "<font color='red'>✖ 授权运行时不可用</font>"
+    : "<font color='red'>✖ 授权未完成</font>";
+  return {
+    schema: "2.0",
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      template: timedOut ? "orange" : "red",
+      title: { tag: "plain_text", content: title },
+      subtitle: { tag: "plain_text", content: subtitle },
+      text_tag_list: LARK_AUTH_CARD_HEADER_TAGS,
+      icon: { tag: "standard_icon", token: timedOut ? "time_outlined" : "close_outlined" },
+    },
+    body: {
+      elements: [
+        { tag: "markdown", content: `技能 **${skillName}** ${content}` },
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          background_style: "default",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: statusText }],
+            },
+            {
+              tag: "column",
+              width: "auto",
+              vertical_align: "center",
+              elements: [{
+                tag: "img",
+                img_key: LARK_AUTH_CARD_FOOTER_IMAGE_KEY,
+                alt: { tag: "plain_text", content: "Paper" },
+                scale_type: "crop_center",
+                size: "80px 24px",
+                transparent: true,
+                preview: false,
+                margin: "0 0 0 8px",
+              }],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
 async function updateAuthStageCard({ messageId, skillName, authReason, accountId, userGrantComplete = false }) {
   if (!messageId || messageId === "sent") return { error: "no messageId" };
   const result = await updateInteractiveCard(
@@ -1103,29 +1456,21 @@ async function updateAuthStageCard({ messageId, skillName, authReason, accountId
   }
   return result;
 }
-async function sendAuthSuccessCard({ skillName, openId, accountId }) {
-  const doneCard = {
-    schema: "2.0",
-    config: { wide_screen_mode: true, width_mode: "compact" },
-    header: {
-      template: "green",
-      title: { tag: "plain_text", content: "授权完成" },
-      subtitle: { tag: "plain_text", content: `技能 “${skillName}” 已可使用` },
-      text_tag_list: LARK_AUTH_CARD_HEADER_TAGS,
-      icon: { tag: "standard_icon", token: "check_outlined" },
-    },
-    body: {
-      elements: [
-        {
-          tag: "markdown",
-          content: `技能 **${skillName}** 的飞书权限已授权成功！现在可以正常使用啦 🦐`,
-        },
-      ],
-    },
-  };
-  return sendInteractiveCard(openId, doneCard, 10000, { accountId });
-}
 
+async function updateAuthFailureCard({ messageId, skillName, accountId, state, authReason }) {
+  if (!messageId || messageId === "sent") return { error: "no messageId" };
+  const result = await updateInteractiveCard(
+    messageId,
+    buildAuthStageFailureCard({ skillName, state, authReason }),
+    { accountId },
+  );
+  if (result?.messageId) {
+    fileLog(`auth card updated skill="${skillName}" state=${state} msg=${messageId}`);
+  } else if (result?.error) {
+    fileLog(`auth card failure update failed skill="${skillName}" state=${state}: ${result.error}`);
+  }
+  return result;
+}
 export function startWaitForAuth({
   authTargetKey,
   skillName,
@@ -1138,6 +1483,7 @@ export function startWaitForAuth({
   authReason = "app_scope",
   ctx,
   authMessageId = null,
+  authWaiter = null,
   onAuthorized = null,
   onAuthCardSent = null,
 }) {
@@ -1147,7 +1493,8 @@ export function startWaitForAuth({
   const existing = activePollingIntervals.get(pollingKey);
   if (existing) {
     clearInterval(existing.interval);
-    existing.completed = true;
+    existing.active = false;
+    cancelAuthWaiter(existing.authWaiter);
     fileLog(`waitForAuth: replacing existing poll for "${pollingKey}"`);
   }
 
@@ -1161,15 +1508,12 @@ export function startWaitForAuth({
   const MAX_WAIT_MS = 180000;
   let interval = null;
   let completed = false;
+  const entry = { interval: null, active: true, authWaiter };
 
-  // 注册到全局 map，供后续去重
-  activePollingIntervals.set(pollingKey, {
-    interval: null,
-    completed: false,
-    get completedRef() {
-      return completed;
-    },
-  });
+  // 注册到全局 map，供后续去重。entry identity also prevents an old in-flight
+  // poll from clearing or completing the poll that replaced it.
+  activePollingIntervals.set(pollingKey, entry);
+  const isActive = () => entry.active && !completed && activePollingIntervals.get(pollingKey) === entry;
 
   const cleanup = () => {
     if (interval) {
@@ -1177,27 +1521,57 @@ export function startWaitForAuth({
       interval = null;
     }
     completed = true;
-    activePollingIntervals.delete(pollingKey);
+    entry.active = false;
+    cancelAuthWaiter(authWaiter);
+    if (activePollingIntervals.get(pollingKey) === entry) {
+      activePollingIntervals.delete(pollingKey);
+    }
   };
 
   const poll = async () => {
-    if (completed) return;
+    if (!isActive()) return;
     try {
       const elapsed = Date.now() - t0;
       if (elapsed > MAX_WAIT_MS) {
         fileLog(
           `waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`,
         );
+        if (authMessageId) {
+          fileLog(`waitForAuth: updating timed-out auth card skill="${skillName}" authReason=${authReason} msg=${authMessageId}`);
+          await updateAuthFailureCard({
+            messageId: authMessageId,
+            skillName,
+            accountId: ctx?.accountId || ctx?.account,
+            state: "timeout",
+            authReason,
+          });
+        }
         cleanup();
         return;
       }
 
       const normalizedIdentity = normalizeAuthIdentity(identity);
+      const userRequiredScopes = Array.isArray(requiredScopes) && requiredScopes.length ? requiredScopes : scopes;
       const check = authReason === "user_grant"
-        ? await checkUserGrant(openId, scopes, ctx, { acceptEmptyMissing: true })
+        ? await checkUserGrant(openId, userRequiredScopes, ctx, { acceptEmptyMissing: true })
         : await checkScopes(scopes, ctx, { identity: normalizedIdentity });
+      if (!isActive()) return;
       if (authReason === "user_grant") {
         fileLog(`waitForAuth: "${skillName}" user grant poll result ${formatGrantCheckForLog(check, { acceptEmptyMissing: true })}`);
+      }
+      if (authReason === "user_grant" && authWaiter?.exited && !check?.ok) {
+        fileLog(`waitForAuth: "${skillName}" user grant waiter exited without authorization code=${authWaiter.exitCode ?? "unknown"}`);
+        if (authMessageId) {
+          await updateAuthFailureCard({
+            messageId: authMessageId,
+            skillName,
+            accountId: ctx?.accountId || ctx?.account,
+            state: check?.oauthState === "oauth_runtime_unavailable" ? "oauth_runtime_unavailable" : "cancelled",
+            authReason,
+          });
+        }
+        cleanup();
+        return;
       }
       if (check?.ok) {
         if (authMessageId) {
@@ -1207,10 +1581,12 @@ export function startWaitForAuth({
             authReason,
             accountId: ctx?.accountId || ctx?.account,
           });
+          if (!isActive()) return;
         }
         if (normalizedIdentity === "user" && authReason !== "user_grant") {
           const userRequiredScopes = Array.isArray(requiredScopes) && requiredScopes.length ? requiredScopes : scopes;
           const userGrantCheck = await checkUserGrant(openId, userRequiredScopes, ctx, { requireScopeDetails: true });
+          if (!isActive()) return;
           fileLog(`waitForAuth: "${skillName}" user grant precheck result ${formatGrantCheckForLog(userGrantCheck, { requireScopeDetails: true })}`);
           if (userGrantCheck.ok) {
             fileLog(
@@ -1218,13 +1594,16 @@ export function startWaitForAuth({
             );
           } else {
             const userGrantMissing = userGrantCheck.missing?.length ? userGrantCheck.missing : userRequiredScopes;
+            const oauthState = userGrantCheck.oauthState || null;
             fileLog(
               `waitForAuth: "${skillName}" app scope authorized, user grant missing or unverifiable: ${userGrantMissing.join(", ")} reason=${userGrantCheck.reason || "not granted"}`,
             );
-            const login = await startLogin(userGrantMissing, ctx, {
+            const login = await startLogin(userRequiredScopes, ctx, {
               identity: "user",
               authReason: "user_grant",
+              ...(oauthState ? { oauthState } : {}),
             });
+          if (!isActive()) return;
           if (login?.verificationUrl) {
             const sent = await sendAuthCard({
               skillName,
@@ -1234,7 +1613,9 @@ export function startWaitForAuth({
               accountId: ctx?.accountId || ctx?.account,
               identity: "user",
               authReason: "user_grant",
+              ...(oauthState ? { oauthState } : {}),
             });
+            if (!isActive()) return;
             if (sent?.messageId) {
               cleanup();
               fileLog(
@@ -1254,6 +1635,7 @@ export function startWaitForAuth({
                     messageId: sent.messageId,
                     ctx,
                   });
+                  if (!isActive()) return;
                 } catch (callbackError) {
                   fileLog(`waitForAuth: onAuthCardSent callback failed for "${skillName}": ${callbackError?.message || callbackError}`);
                 }
@@ -1270,6 +1652,7 @@ export function startWaitForAuth({
                 authReason: "user_grant",
                 ctx,
                 authMessageId: sent.messageId,
+                authWaiter: login.authWaiter,
                 onAuthorized,
                 onAuthCardSent,
               });
@@ -1306,18 +1689,6 @@ export function startWaitForAuth({
             fileLog(`waitForAuth: onAuthorized callback failed for "${skillName}": ${callbackError?.message || callbackError}`);
           }
         }
-        if (openId) {
-          const sent = await sendAuthSuccessCard({
-            skillName,
-            openId,
-            accountId: ctx?.accountId || ctx?.account,
-          });
-          if (!sent?.messageId && sent?.error) {
-            fileLog(
-              `waitForAuth: auth success card failed for "${skillName}": ${sent.error}`,
-            );
-          }
-        }
         return;
       }
     } catch (error) {
@@ -1328,9 +1699,7 @@ export function startWaitForAuth({
   };
 
   interval = setInterval(poll, POLL_MS);
-  // 更新全局 map 中的 interval 引用（创建时 interval 为 null，需要回填）
-  const entry = activePollingIntervals.get(pollingKey);
-  if (entry) entry.interval = interval;
+  entry.interval = interval;
   poll();
 }
 
@@ -1340,25 +1709,39 @@ export async function sendAuthCard({
   verificationUrl,
   userCode,
   openId,
+  receiveId = null,
+  receiveIdType = null,
   accountId,
   identity = "user",
   authReason = "app_scope",
+  oauthState = null,
 }) {
-  if (!openId) return { error: "no openId" };
+  const target = receiveId
+    ? { receiveId, receiveIdType: receiveIdType || "open_id" }
+    : openId
+      ? { receiveId: openId, receiveIdType: "open_id" }
+      : null;
+  if (!target) return { error: "no receiveId" };
   // 用 sidebar-semi applink 包裹，在飞书内以侧边栏打开，不跳转系统浏览器
   const authUrl = sidebarApplink(verificationUrl);
   fileLog(
-    `sendAuthCard: skill="${skillName}" authUrl=${authUrl || "<EMPTY!>"} userCode=${userCode || "<none>"} openId=${openId}`,
+    `sendAuthCard: skill="${skillName}" authUrl=${authUrl || "<EMPTY!>"} userCode=${userCode || "<none>"} receiveId=${target.receiveId} receiveIdType=${target.receiveIdType}`,
   );
   const scopeCount = missing.length;
   const scopeLines = missing.map((s) => `• \`${s}\``).join("\n");
   const normalizedIdentity = normalizeAuthIdentity(identity);
   const isUserGrant = authReason === "user_grant";
+  const isReauthorization = oauthState === "oauth_reauth_required";
+  const isScopeMissing = oauthState === "scope_missing";
   const authTitle = isUserGrant ? "飞书用户授权提醒" : "飞书应用权限开通提醒";
   const authSubtitle = isUserGrant
     ? `技能 “${skillName}” 需要你授权用户身份`
     : `技能 “${skillName}” 需要开通${normalizedIdentity === "user" ? "用户身份" : "应用身份"}权限`;
-  const authIntro = isUserGrant
+  const authIntro = isReauthorization
+    ? `技能需要你重新授权用户身份，以恢复 **${scopeCount}** 项飞书权限访问。`
+    : isScopeMissing
+    ? `当前授权缺少所需权限，技能需要补齐 **${scopeCount}** 项飞书权限访问。`
+    : isUserGrant
     ? `技能需要以你的用户身份访问 **${scopeCount}** 项飞书权限，目前你还没有完成用户授权。`
     : `技能需要应用先开通 **${scopeCount}** 项飞书${normalizedIdentity === "user" ? "用户身份" : "应用身份"}权限。`;
   const scopePanelTitle = isUserGrant ? "查看待授权权限" : "查看待开通权限";
@@ -1448,5 +1831,5 @@ export async function sendAuthCard({
       ],
     },
   };
-  return sendInteractiveCard(openId, card, 20000, { accountId });
+  return sendInteractiveCard(target.receiveId, target.receiveIdType, card, 20000, { accountId });
 }

@@ -50,6 +50,29 @@ test("bumpPendingAuthNoticeFailure increments attempts and schedules the next re
   assert.equal(bumped.status, "retrying");
 });
 
+test("createPendingAuthNotice keeps the card recipient but not an expiring device flow", () => {
+  const notice = createPendingAuthNotice({
+    authTargetKey: "acc-a::/tmp/skill-a/SKILL.md",
+    skillName: "skill-a",
+    skillPath: "/tmp/skill-a/SKILL.md",
+    accountId: "acc-a",
+    missing: ["im:message"],
+    requiredScopes: ["im:message", "contact:user.base:readonly"],
+    receiveId: "oc_group_chat",
+    receiveIdType: "chat_id",
+    oauthState: "scope_missing",
+    verificationUrl: "https://approve.example/expired",
+    deviceCode: "expired-device-code",
+  }, 1000);
+
+  assert.equal(notice.receiveId, "oc_group_chat");
+  assert.equal(notice.receiveIdType, "chat_id");
+  assert.equal(notice.oauthState, "scope_missing");
+  assert.deepEqual(notice.requiredScopes, ["im:message", "contact:user.base:readonly"]);
+  assert.equal("verificationUrl" in notice, false);
+  assert.equal("deviceCode" in notice, false);
+});
+
 test("markPendingAuthNoticeExhausted stops retries after the max retry budget", () => {
   const exhausted = markPendingAuthNoticeExhausted({
     ...createPendingAuthNotice({

@@ -44,8 +44,7 @@ export function createPendingAuthNotice(input, nowMs = Date.now()) {
   const skillName = normalizeString(input?.skillName);
   const skillPath = normalizeString(input?.skillPath);
   const accountId = normalizeString(input?.accountId);
-  const verificationUrl = normalizeString(input?.verificationUrl);
-  if (!authTargetKey || !skillName || !skillPath || !accountId || !verificationUrl || missing.length === 0) {
+  if (!authTargetKey || !skillName || !skillPath || !accountId || missing.length === 0) {
     return null;
   }
 
@@ -56,15 +55,16 @@ export function createPendingAuthNotice(input, nowMs = Date.now()) {
     skillName,
     skillPath,
     accountId,
+    requesterKey: normalizeString(input?.requesterKey),
     openId: normalizeString(input?.openId),
+    receiveId: normalizeString(input?.receiveId),
+    receiveIdType: normalizeString(input?.receiveIdType),
     identity: normalizeString(input?.identity),
     authReason: normalizeString(input?.authReason),
+    oauthState: normalizeString(input?.oauthState),
     missing,
     requiredScopes: requiredScopes.length ? requiredScopes : missing,
     missingKey: normalizeString(input?.missingKey) || missing.slice().sort().join("|"),
-    verificationUrl,
-    userCode: normalizeString(input?.userCode),
-    deviceCode: normalizeString(input?.deviceCode),
     status,
     attemptCount,
     lastAttemptAt: Number(input?.lastAttemptAt || nowMs),

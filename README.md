@@ -245,6 +245,14 @@ openclaw logs --follow
 
 更多 Gateway 侧笔记见 [docs/openclaw-gateway-notes.md](./docs/openclaw-gateway-notes.md)。
 
+### 授权排查与发卡规则
+
+- `lark-cli auth status` 和 `lark-cli auth check` 只反映本地配置/令牌及其 scope 信息，不能单独证明服务端 OAuth 仍有效；插件会使用 `lark-cli auth status --verify` 做校验。
+- 成功校验必须匹配当前应用和当前用户，且 `identities.user.verified === true`；顶层或 bot 身份的 `verified` 不能替代用户身份校验。
+- 明确识别到服务端 `[20005]`（用户令牌失效/撤销）时，会发送重新授权卡片；用户 OAuth 缺少 scope 时，会发送补充授权卡片。
+- 配置、Keychain、网络、profile 或应用/用户身份不匹配时，插件会保守地阻断并输出诊断原因，不发送可能指向错误身份的授权卡片。请先修复诊断问题，再重试 Skill。
+- 卡片会展示当前缺失的 scope；但用户补充授权及后续确认始终使用该 Skill 在 `larkAuth.scopes` 中声明的完整 scope 集合。
+
 ## 版本管理与 npm 发布
 
 这是一个要发布到 npm 的公共工具，版本和公开发布约束需要固定下来。
