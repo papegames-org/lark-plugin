@@ -239,6 +239,11 @@ export function createPluginEntry(overrides = {}) {
     // 插件私有配置在 api.pluginConfig（不是 api.config）
     const cfg = api.pluginConfig || {};
     setPluginApiRef(api);
+    const availableTools = Object.keys(api.tools || {}).sort();
+    const authDebugTools = availableTools.filter((name) =>
+      /check_user_grant|feishu|lark/i.test(name),
+    );
+    fileLog(`register: availableTools=${availableTools.length} authDebugTools=${authDebugTools.join(",") || "<none>"}`);
     resetRuntimeCaches();
     if (cfg.enabled === false) { fileLog("disabled by config"); return; }
     const blockRead = cfg.blockRead !== false;

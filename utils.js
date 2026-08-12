@@ -561,11 +561,65 @@ function isExplicitInvalidAccessTokenStatus(payload, userIdentity) {
     return false;
   }
   const errorCode = String(payload?.error?.code || payload?.code || "").trim();
-  const message = [payload?.message, payload?.error?.message, payload?.error_description]
+  const message = [
+    payload?.message,
+    payload?.error?.message,
+    payload?.error_description,
+    userIdentity?.message,
+  ]
     .map(getStatusString)
     .filter(Boolean)
     .join("\n");
-  return errorCode === "20005" || /\[20005\]/u.test(message);
+  return (
+    errorCode === "20005" ||
+    /\[20005\]/u.test(message) ||
+    /\bneed_user_authorization\b/iu.test(message)
+  );
+}
+
+function isMissingUserIdentity(userIdentity) {
+  return getStatusString(userIdentity?.status).toLowerCase() === "missing" && userIdentity?.available === false;
+}
+
+function isAuthCheckNotLoggedIn(payload, result) {
+  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const parts = [
+    source?.error,
+    source?.message,
+    source?.reason,
+    result?.stderr,
+    result?.stdout,
+  ]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean);
+  return parts.some((part) => /not_logged_in|no user logged in|identity:\s*missing/i.test(part));
+}
+
+async function checkUserGrantScopesViaLarkCli(scopes, profile, options = {}) {
+  fileLog(`checkUserGrant: running lark-cli auth check scopeCount=${scopes.length} profile=${profile || "<default>"}`);
+  const result = await runLarkCli(
+    ["auth", "check", "--scope", scopes.join(" ")],
+    { timeoutMs: 30000, profile },
+  );
+  const payload = extractJsonPayload(result.stdout, result.stderr);
+  if (isAuthCheckNotLoggedIn(payload, result)) {
+    fileLog(`checkUserGrant: lark-cli auth check reported not_logged_in profile=${profile || "<default>"}`);
+    return { kind: "not_logged_in", reason: summarizeCommandResult(result) };
+  }
+  const normalized = normalizeGrantCheckResult(payload, scopes, options);
+  if (!normalized?.hasScopeDetails) {
+    fileLog(`checkUserGrant: lark-cli auth check lacked scope details profile=${profile || "<default>"} reason=${summarizeCommandResult(result)}`);
+    return { kind: "unavailable", reason: summarizeCommandResult(result) };
+  }
+  fileLog(`checkUserGrant: lark-cli auth check normalized ok=${normalized.ok} missing=${JSON.stringify(normalized.missing)} granted=${JSON.stringify(normalized.granted)} profile=${profile || "<default>"}`);
+  return {
+    kind: "result",
+    result: {
+      ...normalized,
+      source: "lark-cli-check",
+      oauthState: normalized.ok ? "authorized" : "scope_missing",
+    },
+  };
 }
 
 function isReauthRequiredLarkCliStatus(payload, expectedAppId, openId) {
@@ -580,9 +634,7 @@ function isReauthRequiredLarkCliStatus(payload, expectedAppId, openId) {
   );
   if (!appMatches || !requesterMatches) return false;
 
-  const isMissingUser =
-    status === "missing" &&
-    userIdentity?.available === false;
+  const isMissingUser = isMissingUserIdentity(userIdentity);
   return isMissingUser || isExplicitInvalidAccessTokenStatus(payload, userIdentity);
 }
 
@@ -641,7 +693,15 @@ async function checkUserGrantViaLarkCli(openId, scopes, ctx = {}, options = {}) 
     payload = extractJsonPayload(result.stdout, result.stderr);
     userIdentity = payload?.identities?.user;
   }
-  if (isReauthRequiredLarkCliStatus(payload, expectedAppId, openId)) {
+  const reauthRequiredByStatus = isReauthRequiredLarkCliStatus(payload, expectedAppId, openId);
+  if (reauthRequiredByStatus && isMissingUserIdentity(userIdentity)) {
+    const authCheck = await checkUserGrantScopesViaLarkCli(scopes, profile, options);
+    if (authCheck?.kind === "result") {
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(authCheck.result, options)}`);
+      return authCheck.result;
+    }
+  }
+  if (reauthRequiredByStatus) {
     const reauthRequired = {
       ok: false,
       missing: scopes,
@@ -888,6 +948,14 @@ export async function getAccountCredentials(ctx) {
     resolvedAccountId = accountIds[0];
     merged = { ...feishuCfg, ...accounts[resolvedAccountId] };
   } else if (!requestedAccountId && feishuCfg.appId && feishuCfg.appSecret) {
+    resolvedAccountId = "default";
+  } else if (
+    requestedAccountId === "default" &&
+    accountIds.length === 0 &&
+    feishuCfg.appId &&
+    feishuCfg.appSecret
+  ) {
+    // 兼容根级单账号配置：飞书消息上下文可能显式传入 default。
     resolvedAccountId = "default";
   } else if (requestedAccountId) {
     throw new Error(
@@ -1138,11 +1206,13 @@ export async function checkUserGrant(openId, scopes, ctx, options = {}) {
     tools.feishu_auth_check_user_grant ||
     tools.lark_auth_check_user_grant ||
     null;
+  fileLog(`checkUserGrant: entry openId=${openId} scopeCount=${scopes.length} hasRuntimeChecker=${checker ? "yes" : "no"}`);
   if (!checker) {
     return await checkUserGrantViaLarkCli(openId, scopes, ctx, options);
   }
   try {
     const appId = await getAppId(ctx).catch(() => null);
+    fileLog(`checkUserGrant: invoking runtime checker appId=${appId || "<unknown>"} accountId=${getAccountId(ctx) || "<unknown>"}`);
     const response = await checker({
       openId,
       scopes,

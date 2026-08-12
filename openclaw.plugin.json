@@ -1,7 +1,7 @@
 {
   "id": "openclaw-skill-runtime",
   "name": "openclaw-skill-runtime",
-  "version": "2.0.6",
+  "version": "0.9.0",
   "description": "读 SKILL.md 时识别 skill 并预授权其声明的飞书 scope（metadata.openclaw.larkAuth）",
   "main": "index.js",
   "activation": {
