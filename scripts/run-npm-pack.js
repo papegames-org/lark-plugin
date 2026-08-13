@@ -104,7 +104,7 @@ function extractPackedFilename(output) {
     .map((s) => s.trim())
     .filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    if (lines[i].endsWith(".tgz")) return lines[i];
+    if (lines[i].endsWith(".tgz")) return lines[i].split(/\s+/).at(-1);
   }
   return null;
 }

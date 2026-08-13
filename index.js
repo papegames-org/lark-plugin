@@ -206,13 +206,16 @@ export function createPluginEntry(overrides = {}) {
   }
 
   // Only inspect actual user messages. OpenClaw's assembled prompt contains every
-  // installed Skill name, so using event.prompt here would incorrectly preflight all
-  // Skills on every conversation turn.
+  // installed Skill name, and event.messages may contain conversation history, so
+  // only the latest user message should trigger explicit skill preflight.
   function findExplicitSkillNames(event, skillMap) {
-    const userText = (Array.isArray(event?.messages) ? event.messages : [])
-      .filter((message) => String(message?.role || "").toLowerCase() === "user")
-      .map((message) => readMessageText(message?.content ?? message))
-      .join("\n");
+    const messages = Array.isArray(event?.messages) ? event.messages : [];
+    const latestUserMessage = [...messages]
+      .reverse()
+      .find((message) => String(message?.role || "").toLowerCase() === "user");
+    const userText = latestUserMessage
+      ? readMessageText(latestUserMessage?.content ?? latestUserMessage)
+      : "";
     if (!userText) return [];
     return [...new Set([...skillMap.values()].filter((skillName) => userText.includes(skillName)))];
   }
@@ -326,6 +329,32 @@ export function createPluginEntry(overrides = {}) {
         block: true,
         reason: `技能「${skillName}」正在等待飞书授权完成，暂不执行后续操作。请完成授权后重试。`,
       };
+    }
+
+    function isFeishuLarkToolName(toolName) {
+      return /(^|[_:.-])(feishu|lark)([_:.-]|$)/i.test(String(toolName || ""));
+    }
+
+    function getToolCommandText(event) {
+      const params = event?.params || {};
+      const value = params.command ?? params.cmd ?? params.script ?? event?.command;
+      if (Array.isArray(value)) return value.join(" ");
+      return typeof value === "string" ? value : "";
+    }
+
+    function isLarkCliCommand(event) {
+      const command = getToolCommandText(event);
+      return /(^|[\s"'`;&|()\\/])(?:lark-cli(?:\.(?:cmd|exe))?|feishu-lark-cli)(?=$|[\s"'`;&|()\\/])/i.test(command);
+    }
+
+    function isProtectedPendingAuthOperation(event, pendingGate, directTarget, skillNameCandidates) {
+      const pendingSkillName = normalizeSkillName(pendingGate?.skillName);
+      if (!pendingSkillName) return false;
+      if (normalizeSkillName(directTarget?.skillName) === pendingSkillName) return true;
+      if (skillNameCandidates.includes(pendingSkillName)) return true;
+      if (isFeishuLarkToolName(event?.toolName)) return true;
+      if (isLarkCliCommand(event)) return true;
+      return false;
     }
 
     function hasExplicitRetryIntent(ctx, skillName) {
@@ -652,7 +681,11 @@ export function createPluginEntry(overrides = {}) {
         const skillNameCandidates = collectSkillNameCandidates(event, ctx, directTarget);
         const isReadTool = event.toolName === "read";
         const pendingGate = getAuthExecutionGate(event, ctx);
-        if (pendingGate && !skillNameCandidates.includes(pendingGate.skillName)) {
+        if (pendingGate && skillNameCandidates.includes(pendingGate.skillName) && !hasExplicitRetryIntent(ctx, pendingGate.skillName)) {
+          fileLog(`auth gate held tool=${event?.toolName || ""} skill="${pendingGate.skillName}"`);
+          return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
+        }
+        if (pendingGate && !skillNameCandidates.includes(pendingGate.skillName) && isProtectedPendingAuthOperation(event, pendingGate, directTarget, skillNameCandidates)) {
           fileLog(`auth gate blocked tool=${event?.toolName || ""} skill="${pendingGate.skillName}"`);
           return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
         }
