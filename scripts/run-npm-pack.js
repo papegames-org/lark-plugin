@@ -75,7 +75,9 @@ function runNpmPack({ pkgDir, destDir, dryRun }) {
   if (dryRun) argv.push("--dry-run");
   argv.push(pkgDir);
 
-  const result = spawnSync("npm", argv, {
+  const npmCommand = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "npm";
+  const npmArgs = process.platform === "win32" ? ["/d", "/s", "/c", "npm.cmd", ...argv] : argv;
+  const result = spawnSync(npmCommand, npmArgs, {
     cwd,
     env,
     encoding: "utf8",

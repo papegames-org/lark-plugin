@@ -208,7 +208,7 @@ test("before_prompt_build preflights an explicitly named skill and sends its aut
   assert.equal(captured.cards[0].openId, "ou_prompt_preflight");
 });
 
-test("before_tool_call allows one replacement auth card during the cooldown", async () => {
+test("before_tool_call deduplicates replacement auth cards during the cooldown", async () => {
   const handlers = new Map();
   const captured = { loginCount: 0, cards: [] };
   const plugin = createPluginEntry({
@@ -259,8 +259,8 @@ test("before_tool_call allows one replacement auth card during the cooldown", as
   assert.equal(first?.block, true);
   assert.equal(second?.block, true);
   assert.equal(third?.block, true);
-  assert.equal(captured.loginCount, 2);
-  assert.equal(captured.cards.length, 2);
+  assert.equal(captured.loginCount, 1);
+  assert.equal(captured.cards.length, 1);
 });
 
 test("before_tool_call can resolve the test skill from ctx.skillCommand when read path is unavailable", async () => {
@@ -650,7 +650,7 @@ test("before_tool_call sends user-grant card when app scopes are open but user g
   assert.equal(afterUserGrant?.block, true);
 });
 
-test("before_tool_call allows one user-grant card retry after background app-scope poll sends one", async () => {
+test("before_tool_call deduplicates a user-grant card after background app-scope poll sends one", async () => {
   const handlers = new Map();
   const scopes = ["aily:data_asset:upload_file", "base:block:create"];
   const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
@@ -717,7 +717,7 @@ test("before_tool_call allows one user-grant card retry after background app-sco
 
   const second = await handlers.get("before_tool_call")(event, ctx);
   assert.equal(second?.block, true);
-  assert.equal(captured.sendAuthCard.length, 2);
+  assert.equal(captured.sendAuthCard.length, 1);
 });
 test("before_tool_call allows user identity skill when user grant scopes are verified", async () => {
   const handlers = new Map();

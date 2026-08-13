@@ -122,6 +122,12 @@ const blockRead = cfg.blockRead !== false;
 - 生成增量授权链接
 - 发送飞书交互卡片
 
+对于 `identity=user` 的 Skill，插件还会补一层本地 `lark-cli` 绑定健康检查：
+
+- 若存在与当前 OpenClaw `appId` 匹配的 profile，插件会在该 profile 下自动执行一次安全的 `bind` 自愈。
+- 若 `profile list` 为空，插件使用 lark-cli 的 OpenClaw workspace 默认上下文执行 bind；若存在其它应用 profile 但没有匹配项，则保守阻断，避免绑定错误应用。
+- 用户可见的 OAuth 入口始终应是飞书授权卡片；终端日志只用于排障，不作为最终用户操作入口。
+
 ## 安装
 
 ### To Human
@@ -247,10 +253,9 @@ openclaw logs --follow
 
 ### 授权排查与发卡规则
 
-- `lark-cli auth status` 和 `lark-cli auth check` 只反映本地配置/令牌及其 scope 信息，不能单独证明服务端 OAuth 仍有效；插件会使用 `lark-cli auth status --verify` 做校验。
-- 成功校验必须匹配当前应用和当前用户，且 `identities.user.verified === true`；顶层或 bot 身份的 `verified` 不能替代用户身份校验。
-- 明确识别到服务端 `[20005]`（用户令牌失效/撤销）时，会发送重新授权卡片；用户 OAuth 缺少 scope 时，会发送补充授权卡片。
-- 配置、Keychain、网络、profile 或应用/用户身份不匹配时，插件会保守地阻断并输出诊断原因，不发送可能指向错误身份的授权卡片。请先修复诊断问题，再重试 Skill。
+- 插件使用 `lark-cli auth status --verify` 校验用户 OAuth，并要求 appId、openId、`identities.user.verified` 和完整 scope 同时匹配。
+- 用户需要授权时，插件调用 `lark-cli auth login --scope ... --no-wait --json` 生成卡片链接，再由后台 `lark-cli auth login --device-code ...` 完成轮询、兑换和 token 持久化；插件不另存 OAuth token。
+- 明确识别到用户令牌失效、撤权或缺少 scope 时，会发送重新授权/补充授权卡片；配置、网络、profile 或身份无法可靠判定时则保守阻断。
 - 卡片会展示当前缺失的 scope；但用户补充授权及后续确认始终使用该 Skill 在 `larkAuth.scopes` 中声明的完整 scope 集合。
 
 ## 版本管理与 npm 发布

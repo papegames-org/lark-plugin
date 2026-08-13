@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   buildSkillRootsCacheKey,
   cacheSenderId,
@@ -29,8 +30,8 @@ import {
 
 test("getDefaultSkillRoots includes agent and OpenClaw global skill roots", () => {
   assert.deepEqual(getDefaultSkillRoots({}), [
-    `${homedir()}/.agents/skills`,
-    `${homedir()}/.openclaw/workspace/skills`,
+    join(homedir(), ".agents", "skills"),
+    join(homedir(), ".openclaw", "workspace", "skills"),
   ]);
 });
 
@@ -67,10 +68,11 @@ test("getSkillAuthCacheKey isolates same skill path by account", () => {
 });
 
 test("resolveSkillReadTarget recognizes direct OpenClaw skill reads without workspaceDir", () => {
+  const skillPath = "/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md";
   assert.deepEqual(
-    resolveSkillReadTarget("/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md"),
+    resolveSkillReadTarget(skillPath),
     {
-      abs: "/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md",
+      abs: resolve(skillPath),
       skillName: "feishu-auth-basic",
     },
   );
@@ -929,8 +931,27 @@ test("startLogin uses lark-cli device flow for user grants", async () => {
   delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
   const oldLarkProfile = process.env.LARK_PROFILE_NAME;
   delete process.env.LARK_PROFILE_NAME;
+  resetRuntimeCaches();
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          "acc-a": { appId: "cli_app", appSecret: "secret_123" },
+        },
+      },
+    },
+  });
   setLarkCliCommandRunnerForTest(async (args) => {
     commandCalls.push(args);
+    if (args[0] === "--version") {
+      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "profile" && args[1] === "list") {
+      return { stdout: "[]", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "config" && args[1] === "bind") {
+      return { stdout: JSON.stringify({ ok: true }), stderr: "", code: 0, ok: true };
+    }
     return {
       stdout: JSON.stringify({ verification_url: "https://example.com/user-login", device_code: "device-123", expires_in: 600, interval: 5 }),
       stderr: "",
@@ -949,7 +970,12 @@ test("startLogin uses lark-cli device flow for user grants", async () => {
     assert.equal(result.deviceCode, "device-123");
     assert.equal(result.provider, "lark-cli");
     assert.equal(result.authWaiter, waiter);
-    assert.deepEqual(commandCalls, [["--version"], ["auth", "login", "--scope", "scope:a", "--no-wait", "--json"]]);
+    assert.deepEqual(commandCalls, [
+      ["--version"],
+      ["profile", "list"],
+      ["config", "bind", "--source", "openclaw", "--app-id", "cli_app", "--identity", "user-default"],
+      ["auth", "login", "--scope", "scope:a", "--no-wait", "--json"],
+    ]);
     assert.deepEqual(spawnCalls, [["auth", "login", "--device-code", "device-123"]]);
   } finally {
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
@@ -958,12 +984,15 @@ test("startLogin uses lark-cli device flow for user grants", async () => {
     else process.env.LARK_PROFILE_NAME = oldLarkProfile;
     setLarkCliCommandRunnerForTest(null);
     setLarkCliDeviceWaitSpawnerForTest(null);
+    setApiConfigRef(null);
+    resetRuntimeCaches();
   }
 });
 
 test("startWaitForAuth cancels a spawned device waiter after authorization completes", async () => {
   let cancelled = 0;
   const waiter = { started: true, exited: false, cancel() { cancelled += 1; } };
+  resetRuntimeCaches();
   setPluginApiRef({
     tools: {
       async openclaw_lark_check_user_grant() {
@@ -973,7 +1002,18 @@ test("startWaitForAuth cancels a spawned device waiter after authorization compl
   });
   setApiConfigRef({ channels: { feishu: { accounts: { "acc-a": { appId: "cli_app", appSecret: "secret" } } } } });
   setLarkCliDeviceWaitSpawnerForTest(() => waiter);
-  setLarkCliCommandRunnerForTest(async () => ({ stdout: JSON.stringify({ verification_url: "https://example.com/login", device_code: "device-cancel" }), stderr: "", code: 0, ok: true }));
+  setLarkCliCommandRunnerForTest(async (args) => {
+    if (args[0] === "--version") {
+      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "profile" && args[1] === "list") {
+      return { stdout: "[]", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "config" && args[1] === "bind") {
+      return { stdout: JSON.stringify({ ok: true }), stderr: "", code: 0, ok: true };
+    }
+    return { stdout: JSON.stringify({ verification_url: "https://example.com/login", device_code: "device-cancel" }), stderr: "", code: 0, ok: true };
+  });
   try {
     const login = await startLogin(["scope:a"], { accountId: "acc-a" }, { identity: "user", authReason: "user_grant" });
     startWaitForAuth({ authTargetKey: "cancel-waiter", skillName: "feishu-auth-basic", deviceCode: login.deviceCode, openId: "ou_cancel_waiter", scopes: ["scope:a"], requiredScopes: ["scope:a"], authReason: "user_grant", authWaiter: login.authWaiter, ctx: { accountId: "acc-a" } });
@@ -984,6 +1024,7 @@ test("startWaitForAuth cancels a spawned device waiter after authorization compl
     setLarkCliDeviceWaitSpawnerForTest(null);
     setPluginApiRef(null);
     setApiConfigRef(null);
+    resetRuntimeCaches();
   }
 });
 
@@ -1084,6 +1125,12 @@ test("startWaitForAuth polls app-scope completion without app device code", asyn
   setLarkCliCommandRunnerForTest(async (args) => {
     if (args[0] === "--version") {
       return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "profile" && args[1] === "list") {
+      return { stdout: "[]", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "config" && args[1] === "bind") {
+      return { stdout: JSON.stringify({ ok: true }), stderr: "", code: 0, ok: true };
     }
     if (args[0] === "auth" && args[1] === "status") {
       authCheckCount += 1;
@@ -1222,6 +1269,12 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
   setLarkCliCommandRunnerForTest(async (args) => {
     if (args[0] === "--version") {
       return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "profile" && args[1] === "list") {
+      return { stdout: "[]", stderr: "", code: 0, ok: true };
+    }
+    if (args[0] === "config" && args[1] === "bind") {
+      return { stdout: JSON.stringify({ ok: true }), stderr: "", code: 0, ok: true };
     }
     if (args[0] === "auth" && args[1] === "status") {
       authCheckCount += 1;

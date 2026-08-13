@@ -328,6 +328,11 @@ export function createPluginEntry(overrides = {}) {
       };
     }
 
+    function hasExplicitRetryIntent(ctx, skillName) {
+      return ctx?.authIntent?.type === "explicit_skill_retry"
+        && normalizeSkillName(ctx.authIntent.skillName) === normalizeSkillName(skillName);
+    }
+
     function persistPendingAuthNotices() {
       writePendingAuthNoticeStore(pendingAuthStorePath, pendingAuthNotices);
     }
@@ -556,6 +561,7 @@ export function createPluginEntry(overrides = {}) {
           if (latest?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
         }
       }, delayMs);
+      timer?.unref?.();
       pendingAuthRetryTimers.set(authTargetKey, timer);
     }
 
@@ -608,6 +614,7 @@ export function createPluginEntry(overrides = {}) {
             params: { path: skillPath },
           }, {
             ...ctx,
+            authIntent: { type: "explicit_skill_retry", skillName },
             skillCommand: { skillName },
           });
           if (result?.block) return result;
@@ -832,9 +839,9 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
         }
         if (cache && cache.requesterKey === requesterKey && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
-          if (!cache.retryConsumed) {
+          if (!cache.retryConsumed && hasExplicitRetryIntent(ctx, skillName)) {
             skillAuthCache.set(authTargetKey, { ...cache, retryConsumed: true });
-            fileLog(`retry: authTargetKey="${authTargetKey}" explicit retry allowed during cooldown`);
+            fileLog(`retry: authTargetKey="${authTargetKey}" explicit user retry allowed during cooldown`);
           } else {
             fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
             return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;

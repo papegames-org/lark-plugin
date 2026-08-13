@@ -50,6 +50,8 @@ export function resetRuntimeCaches() {
   runtimeHealthCache = null;
   appScopesCache.clear();
   larkCliProfileByAppId.clear();
+  larkCliBindingStateByAppId.clear();
+  clearActivePollingIntervals();
 }
 
 // ---------- 日志 ----------
@@ -368,6 +370,7 @@ function formatError(error) {
 let larkCliCommandRunnerForTest = null;
 let larkCliDeviceWaitSpawnerForTest = null;
 const larkCliProfileByAppId = new Map();
+const larkCliBindingStateByAppId = new Map();
 
 export function setLarkCliCommandRunnerForTest(runner) {
   larkCliCommandRunnerForTest = typeof runner === "function" ? runner : null;
@@ -448,6 +451,7 @@ function summarizeCommandResult(result) {
 
 const LARK_CLI_REQUIRED_MESSAGE = "lark-cli is required for identity=user authorization. Install @larksuite/cli, ensure the gateway PATH can find lark-cli, run `lark-cli config bind --source openclaw --identity user-default`, then restart gateway.";
 const LARK_CLI_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+const LARK_CLI_BINDING_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function isLarkCliMissingResult(result) {
   const parts = [
@@ -505,6 +509,10 @@ async function resolveLarkCliProfile(ctx = {}) {
   if (!listed?.ok && !(listed?.code === 0 && !listed?.error)) {
     return { error: `lark-cli profile list failed: ${summarizeCommandResult(listed)}` };
   }
+  if (Array.isArray(profiles) && profiles.length === 0) {
+    larkCliProfileByAppId.set(appId, { profile: null, resolvedAtMs: Date.now() });
+    return { resolved: true, profile: null, source: "workspace-default" };
+  }
   const match = profiles?.find((item) =>
     String(item?.appId || item?.app_id || "").trim() === String(appId).trim() &&
     String(item?.name || "").trim(),
@@ -514,6 +522,75 @@ async function resolveLarkCliProfile(ctx = {}) {
   larkCliProfileByAppId.set(appId, { profile, resolvedAtMs: Date.now() });
   fileLog(`lark-cli profile resolved appId=${appId} profile=${profile}`);
   return { resolved: true, profile, source: "profile-list" };
+}
+
+async function bindOpenClawProfile(profile, appId) {
+  const bindArgs = [
+    "config",
+    "bind",
+    "--source",
+    "openclaw",
+    "--app-id",
+    String(appId || "").trim(),
+    "--identity",
+    "user-default",
+  ];
+  const result = await runLarkCli(bindArgs, { timeoutMs: 15000, profile });
+  if (result?.ok || (result?.code === 0 && !result?.error)) return { ok: true };
+
+  const detail = summarizeCommandResult(result);
+  const needsForce = /\b--force\b|bot-only\s*[-=]?>\s*user-default|risky transition|user-default identity change/iu.test(detail);
+  if (!needsForce) return { ok: false, error: detail };
+
+  const forced = await runLarkCli([...bindArgs, "--force"], { timeoutMs: 15000, profile });
+  if (forced?.ok || (forced?.code === 0 && !forced?.error)) return { ok: true, forced: true };
+  return { ok: false, error: summarizeCommandResult(forced) };
+}
+
+export async function ensureLarkCliBindingReady(ctx = {}) {
+  const health = await checkLarkCliRuntimeReady();
+  if (!health.ok) {
+    return { ok: false, state: "blocked", reason: health.error, precondition: "lark-cli" };
+  }
+
+  const appId = await getAppId(ctx).catch(() => null);
+  if (!appId) {
+    return { ok: false, state: "blocked", reason: "OpenClaw Feishu appId unavailable", precondition: "openclaw-app-id" };
+  }
+
+  const configuredProfile = getConfiguredLarkCliProfile();
+  const profileResolution = configuredProfile
+    ? { resolved: true, profile: configuredProfile, source: "env" }
+    : await resolveLarkCliProfile(ctx);
+  if (!profileResolution?.resolved) {
+    return {
+      ok: false,
+      state: "blocked",
+      reason: profileResolution?.error || `no lark-cli profile matches OpenClaw appId=${appId}; initialize local lark-cli app config before user authorization can start`,
+      precondition: "lark-cli-profile",
+    };
+  }
+
+  const profile = profileResolution.profile;
+  const cached = larkCliBindingStateByAppId.get(appId);
+  if (cached && cached.profile === profile && (Date.now() - cached.checkedAtMs) < LARK_CLI_BINDING_CACHE_TTL_MS) {
+    return { ok: true, state: "ready", profile, appId, identity: "user-default" };
+  }
+
+  const bound = await bindOpenClawProfile(profile, appId);
+  if (!bound.ok) {
+    return {
+      ok: false,
+      state: "blocked",
+      reason: `lark-cli config bind failed for profile=${profile} appId=${appId}: ${bound.error || "unknown error"}`,
+      precondition: "lark-cli-bind",
+      profile,
+      appId,
+    };
+  }
+
+  larkCliBindingStateByAppId.set(appId, { profile, checkedAtMs: Date.now() });
+  return { ok: true, state: "healed", profile, appId, identity: "user-default" };
 }
 
 function spawnLarkCliDeviceWait(deviceCode, profile = undefined) {
@@ -552,216 +629,17 @@ function spawnLarkCliDeviceWait(deviceCode, profile = undefined) {
   }
 }
 
-function getStatusString(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function isExplicitInvalidAccessTokenStatus(payload, userIdentity) {
-  if (getStatusString(userIdentity?.status).toLowerCase() !== "verify_failed" || userIdentity?.verified !== false) {
-    return false;
-  }
-  const errorCode = String(payload?.error?.code || payload?.code || "").trim();
-  const message = [
-    payload?.message,
-    payload?.error?.message,
-    payload?.error_description,
-    userIdentity?.message,
-  ]
-    .map(getStatusString)
-    .filter(Boolean)
-    .join("\n");
-  return (
-    errorCode === "20005" ||
-    /\[20005\]/u.test(message) ||
-    /\bneed_user_authorization\b/iu.test(message)
-  );
-}
-
-function isMissingUserIdentity(userIdentity) {
-  return getStatusString(userIdentity?.status).toLowerCase() === "missing" && userIdentity?.available === false;
-}
-
-function isAuthCheckNotLoggedIn(payload, result) {
-  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-  const parts = [
-    source?.error,
-    source?.message,
-    source?.reason,
-    result?.stderr,
-    result?.stdout,
-  ]
-    .map((part) => String(part || "").trim())
-    .filter(Boolean);
-  return parts.some((part) => /not_logged_in|no user logged in|identity:\s*missing/i.test(part));
-}
-
-async function checkUserGrantScopesViaLarkCli(scopes, profile, options = {}) {
-  fileLog(`checkUserGrant: running lark-cli auth check scopeCount=${scopes.length} profile=${profile || "<default>"}`);
-  const result = await runLarkCli(
-    ["auth", "check", "--scope", scopes.join(" ")],
-    { timeoutMs: 30000, profile },
-  );
-  const payload = extractJsonPayload(result.stdout, result.stderr);
-  if (isAuthCheckNotLoggedIn(payload, result)) {
-    fileLog(`checkUserGrant: lark-cli auth check reported not_logged_in profile=${profile || "<default>"}`);
-    return { kind: "not_logged_in", reason: summarizeCommandResult(result) };
-  }
-  const normalized = normalizeGrantCheckResult(payload, scopes, options);
-  if (!normalized?.hasScopeDetails) {
-    fileLog(`checkUserGrant: lark-cli auth check lacked scope details profile=${profile || "<default>"} reason=${summarizeCommandResult(result)}`);
-    return { kind: "unavailable", reason: summarizeCommandResult(result) };
-  }
-  fileLog(`checkUserGrant: lark-cli auth check normalized ok=${normalized.ok} missing=${JSON.stringify(normalized.missing)} granted=${JSON.stringify(normalized.granted)} profile=${profile || "<default>"}`);
-  return {
-    kind: "result",
-    result: {
-      ...normalized,
-      source: "lark-cli-check",
-      oauthState: normalized.ok ? "authorized" : "scope_missing",
-    },
-  };
-}
-
-function isReauthRequiredLarkCliStatus(payload, expectedAppId, openId) {
-  const userIdentity = payload?.identities?.user;
-  const status = getStatusString(userIdentity?.status).toLowerCase();
-  const appMatches =
-    Boolean(expectedAppId) &&
-    getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId);
-  const requesterMatches = Boolean(openId) && (
-    getStatusString(userIdentity?.openId || userIdentity?.open_id) === getStatusString(openId) ||
-    (status === "missing" && userIdentity?.available === false && !getStatusString(userIdentity?.openId || userIdentity?.open_id))
-  );
-  if (!appMatches || !requesterMatches) return false;
-
-  const isMissingUser = isMissingUserIdentity(userIdentity);
-  return isMissingUser || isExplicitInvalidAccessTokenStatus(payload, userIdentity);
-}
-
-async function checkUserGrantViaLarkCli(openId, scopes, ctx = {}, options = {}) {
-  const health = await checkLarkCliRuntimeReady();
-  if (!health.ok) {
-    const failed = {
-      ok: false,
-      missing: scopes,
-      granted: [],
-      unavailable: true,
-      source: "lark-cli",
-      oauthState: "oauth_runtime_unavailable",
-      reason: health.error,
-      precondition: "lark-cli",
-    };
-    fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
-    return failed;
-  }
-  const expectedAppId = await getAppId(ctx).catch(() => null);
-  const configuredProfile = getConfiguredLarkCliProfile();
-  const cachedProfile = !configuredProfile && expectedAppId
-    ? larkCliProfileByAppId.get(expectedAppId)
-    : null;
-  let profile = configuredProfile || cachedProfile?.profile || null;
-  let result = await runLarkCli(
-    ["auth", "status", "--verify"],
-    { timeoutMs: 30000, profile },
-  );
-  let payload = extractJsonPayload(result.stdout, result.stderr);
-  let userIdentity = payload?.identities?.user;
-  const defaultProfileMatchesApp =
-    !configuredProfile &&
-    String(payload?.appId || payload?.app_id || "").trim() === String(expectedAppId || "").trim();
-  if (defaultProfileMatchesApp && expectedAppId) {
-    larkCliProfileByAppId.set(expectedAppId, { profile: null, resolvedAtMs: Date.now() });
-  }
-  if (!configuredProfile && !profile && !defaultProfileMatchesApp) {
-    const profileResolution = await resolveLarkCliProfile(ctx);
-    if (!profileResolution.resolved) {
-      const failed = {
-        ok: false,
-        missing: scopes,
-        granted: [],
-        unavailable: true,
-        source: "lark-cli",
-        oauthState: "oauth_runtime_unavailable",
-        reason: profileResolution.error || "lark-cli profile unavailable",
-        precondition: "lark-cli-profile",
-      };
-      fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
-      return failed;
-    }
-    profile = profileResolution.profile;
-    result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
-    payload = extractJsonPayload(result.stdout, result.stderr);
-    userIdentity = payload?.identities?.user;
-  }
-  const reauthRequiredByStatus = isReauthRequiredLarkCliStatus(payload, expectedAppId, openId);
-  if (reauthRequiredByStatus && isMissingUserIdentity(userIdentity)) {
-    const authCheck = await checkUserGrantScopesViaLarkCli(scopes, profile, options);
-    if (authCheck?.kind === "result") {
-      fileLog(`checkUserGrant result ${formatGrantCheckForLog(authCheck.result, options)}`);
-      return authCheck.result;
-    }
-  }
-  if (reauthRequiredByStatus) {
-    const reauthRequired = {
-      ok: false,
-      missing: scopes,
-      granted: [],
-      source: "lark-cli-status",
-      oauthState: "oauth_reauth_required",
-      reason: summarizeCommandResult(result),
-    };
-    fileLog(`checkUserGrant result ${formatGrantCheckForLog(reauthRequired, options)}`);
-    return reauthRequired;
-  }
-  const commandSucceeded = result?.ok === true || (result?.code === 0 && !result?.error);
-  const statusMatchesRequester =
-    commandSucceeded &&
-    Boolean(expectedAppId) &&
-    String(payload?.appId || payload?.app_id || "").trim() === String(expectedAppId).trim() &&
-    String(userIdentity?.openId || userIdentity?.open_id || "").trim() === String(openId || "").trim() &&
-    userIdentity?.available === true &&
-    userIdentity?.verified === true;
-  if (statusMatchesRequester) {
-    const normalized = normalizeGrantCheckResult(
-      { scope: userIdentity.scope || userIdentity.scopes || [] },
-      scopes,
-      options,
-    );
-    if (normalized) {
-      const withSource = {
-        ...normalized,
-        source: "lark-cli-status",
-        oauthState: normalized.ok ? "authorized" : "scope_missing",
-      };
-      fileLog(`checkUserGrant result ${formatGrantCheckForLog(withSource, options)}`);
-      return withSource;
-    }
-  }
-  const fallback = {
-    ok: false,
-    missing: scopes,
-    granted: [],
-    unavailable: true,
-    source: "lark-cli",
-    oauthState: "oauth_runtime_unavailable",
-    reason: summarizeCommandResult(result),
-  };
-  fileLog(`checkUserGrant result ${formatGrantCheckForLog(fallback, options)}`);
-  return fallback;
-}
-
 async function startUserGrantLogin(scopes, ctx = {}) {
-  const profileResolution = await resolveLarkCliProfile(ctx);
-  if (!profileResolution.resolved) {
-    return { error: profileResolution.error || "lark-cli profile unavailable", precondition: "lark-cli-profile" };
-  }
-  const health = await checkLarkCliRuntimeReady(profileResolution.profile);
-  if (!health.ok) {
-    return { error: health.error, precondition: "lark-cli" };
+  const binding = await ensureLarkCliBindingReady(ctx);
+  if (!binding.ok) {
+    return {
+      error: binding.reason || "lark-cli binding unavailable",
+      precondition: binding.precondition || "lark-cli-bind",
+    };
   }
   const result = await runLarkCli(
     ["auth", "login", "--scope", scopes.join(" "), "--no-wait", "--json"],
-    { timeoutMs: 30000, profile: profileResolution.profile },
+    { timeoutMs: 30000, profile: binding.profile },
   );
   const payload = extractJsonPayload(result.stdout, result.stderr);
   const verificationUrl = String(
@@ -773,10 +651,9 @@ async function startUserGrantLogin(scopes, ctx = {}) {
       "",
   ).trim();
   const deviceCode = String(payload?.device_code || payload?.deviceCode || "").trim();
-  if (!verificationUrl || !deviceCode) {
-    return { error: summarizeCommandResult(result) };
-  }
-  const waiter = spawnLarkCliDeviceWait(deviceCode, profileResolution.profile);
+  if (!verificationUrl || !deviceCode) return { error: summarizeCommandResult(result) };
+
+  const waiter = spawnLarkCliDeviceWait(deviceCode, binding.profile);
   if (waiter?.error) {
     fileLog(`startLogin: lark-cli device waiter failed: ${waiter.error}`);
   } else {
@@ -833,6 +710,32 @@ export function normalizeAppScopeEntries(scopesArr) {
     entries.push({ scope, identity, raw: item });
   }
   return entries;
+}
+
+export function scopeSatisfiesAppScope(scope, grantedSet, grantedList = []) {
+  const requested = String(scope || "").trim();
+  if (!requested) return false;
+  const normalizedGrantedSet = grantedSet instanceof Set
+    ? grantedSet
+    : new Set(Array.isArray(grantedList) ? grantedList.map((entry) => String(entry || "").trim()).filter(Boolean) : []);
+  if (normalizedGrantedSet.has(requested)) return true;
+
+  const normalizedGrantedList = Array.isArray(grantedList)
+    ? grantedList.map((entry) => String(entry || "").trim()).filter(Boolean)
+    : [...normalizedGrantedSet];
+
+  const requestedPrefix = `${requested}:`;
+  if (normalizedGrantedList.some((entry) => entry.startsWith(requestedPrefix))) {
+    return true;
+  }
+
+  let prefix = requested;
+  while (prefix.includes(":")) {
+    prefix = prefix.slice(0, prefix.lastIndexOf(":"));
+    if (normalizedGrantedSet.has(prefix)) return true;
+  }
+
+  return false;
 }
 
 function hasIdentityMetadata(entries) {
@@ -1058,8 +961,12 @@ export async function checkScopes(scopes, ctx, options = {}) {
 
   for (const scope of scopes) {
     const hasScope = identityAware
-      ? appScopeEntries.some((entry) => entry.scope === scope && entry.identity === identity)
-      : legacyScopeSet.has(scope);
+      ? scopeSatisfiesAppScope(
+        scope,
+        new Set(appScopeEntries.filter((entry) => entry.identity === identity).map((entry) => entry.scope)),
+        appScopeEntries.filter((entry) => entry.identity === identity).map((entry) => entry.scope),
+      )
+      : scopeSatisfiesAppScope(scope, legacyScopeSet, [...legacyScopeSet]);
     if (hasScope) granted.push(scope);
     else missing.push(scope);
   }
@@ -1157,6 +1064,136 @@ function hasTrustedRuntimeGrantAttestation(response, expectedAppId, expectedOpen
     Boolean(expectedOpenId) &&
     receivedAppId === String(expectedAppId).trim() &&
     receivedOpenId === String(expectedOpenId).trim();
+}
+
+function getStatusString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isExplicitInvalidAccessTokenStatus(payload, userIdentity) {
+  if (getStatusString(userIdentity?.status).toLowerCase() !== "verify_failed" || userIdentity?.verified !== false) {
+    return false;
+  }
+  const errorCode = String(payload?.error?.code || payload?.code || "").trim();
+  const message = [
+    payload?.message,
+    payload?.error?.message,
+    payload?.error_description,
+    userIdentity?.message,
+  ].map(getStatusString).filter(Boolean).join("\n");
+  return errorCode === "20005" || /\[20005\]/u.test(message) || /\bneed_user_authorization\b/iu.test(message);
+}
+
+function isReauthRequiredLarkCliStatus(payload, expectedAppId, openId) {
+  const userIdentity = payload?.identities?.user;
+  const status = getStatusString(userIdentity?.status).toLowerCase();
+  const appMatches = Boolean(expectedAppId) &&
+    getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId);
+  const requesterMatches = Boolean(openId) && (
+    getStatusString(userIdentity?.openId || userIdentity?.open_id) === getStatusString(openId) ||
+    (status === "missing" && userIdentity?.available === false && !getStatusString(userIdentity?.openId || userIdentity?.open_id))
+  );
+  if (!appMatches || !requesterMatches) return false;
+  return (status === "missing" && userIdentity?.available === false) ||
+    isExplicitInvalidAccessTokenStatus(payload, userIdentity);
+}
+
+async function checkUserGrantViaLarkCli(openId, scopes, ctx = {}, options = {}) {
+  const health = await checkLarkCliRuntimeReady();
+  if (!health.ok) {
+    const failed = {
+      ok: false,
+      missing: scopes,
+      granted: [],
+      unavailable: true,
+      source: "lark-cli",
+      oauthState: "oauth_runtime_unavailable",
+      reason: health.error,
+      precondition: "lark-cli",
+    };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
+    return failed;
+  }
+  const expectedAppId = await getAppId(ctx).catch(() => null);
+  const configuredProfile = getConfiguredLarkCliProfile();
+  const cachedProfile = !configuredProfile && expectedAppId ? larkCliProfileByAppId.get(expectedAppId) : null;
+  let profile = configuredProfile || cachedProfile?.profile || null;
+  let result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
+  let payload = extractJsonPayload(result.stdout, result.stderr);
+  let userIdentity = payload?.identities?.user;
+  const defaultProfileMatchesApp = !configuredProfile &&
+    getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId);
+  if (defaultProfileMatchesApp && expectedAppId) {
+    larkCliProfileByAppId.set(expectedAppId, { profile: null, resolvedAtMs: Date.now() });
+  }
+  if (!configuredProfile && !profile && !defaultProfileMatchesApp) {
+    const profileResolution = await resolveLarkCliProfile(ctx);
+    if (!profileResolution.resolved) {
+      const failed = {
+        ok: false,
+        missing: scopes,
+        granted: [],
+        unavailable: true,
+        source: "lark-cli",
+        oauthState: "oauth_runtime_unavailable",
+        reason: profileResolution.error || "lark-cli profile unavailable",
+        precondition: "lark-cli-profile",
+      };
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(failed, options)}`);
+      return failed;
+    }
+    profile = profileResolution.profile;
+    result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
+    payload = extractJsonPayload(result.stdout, result.stderr);
+    userIdentity = payload?.identities?.user;
+  }
+  if (isReauthRequiredLarkCliStatus(payload, expectedAppId, openId)) {
+    const reauthRequired = {
+      ok: false,
+      missing: scopes,
+      granted: [],
+      source: "lark-cli-status",
+      oauthState: "oauth_reauth_required",
+      reason: summarizeCommandResult(result),
+    };
+    fileLog(`checkUserGrant result ${formatGrantCheckForLog(reauthRequired, options)}`);
+    return reauthRequired;
+  }
+  const commandSucceeded = result?.ok === true || (result?.code === 0 && !result?.error);
+  const statusMatchesRequester = commandSucceeded &&
+    Boolean(expectedAppId) &&
+    getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId) &&
+    getStatusString(userIdentity?.openId || userIdentity?.open_id) === getStatusString(openId) &&
+    userIdentity?.available === true &&
+    userIdentity?.verified === true;
+  if (statusMatchesRequester) {
+    const normalized = normalizeGrantCheckResult(
+      { scope: userIdentity.scope || userIdentity.scopes || [] },
+      scopes,
+      options,
+    );
+    if (normalized) {
+      const verified = {
+        ...normalized,
+        source: "lark-cli-status",
+        oauthState: normalized.ok ? "authorized" : "scope_missing",
+      };
+      fileLog(`checkUserGrant result ${formatGrantCheckForLog(verified, options)}`);
+      return verified;
+    }
+  }
+
+  const unavailable = {
+    ok: false,
+    missing: scopes,
+    granted: [],
+    unavailable: true,
+    source: "lark-cli",
+    oauthState: "oauth_runtime_unavailable",
+    reason: summarizeCommandResult(result),
+  };
+  fileLog(`checkUserGrant result ${formatGrantCheckForLog(unavailable, options)}`);
+  return unavailable;
 }
 
 function formatGrantCheckForLog(result, options = {}) {
@@ -1282,6 +1319,15 @@ export function sidebarApplink(authUrl) {
 
 /** 按 skillName 去重的轮询定时器，防止同一技能创建多个轮询 */
 const activePollingIntervals = new Map();
+
+function clearActivePollingIntervals() {
+  for (const entry of activePollingIntervals.values()) {
+    if (entry?.interval) clearInterval(entry.interval);
+    entry.active = false;
+    cancelAuthWaiter(entry?.authWaiter);
+  }
+  activePollingIntervals.clear();
+}
 
 function cancelAuthWaiter(waiter) {
   if (!waiter || waiter.exited || waiter.cancelled) return;
@@ -1622,9 +1668,12 @@ export function startWaitForAuth({
 
       const normalizedIdentity = normalizeAuthIdentity(identity);
       const userRequiredScopes = Array.isArray(requiredScopes) && requiredScopes.length ? requiredScopes : scopes;
-      const check = authReason === "user_grant"
-        ? await checkUserGrant(openId, userRequiredScopes, ctx, { acceptEmptyMissing: true })
-        : await checkScopes(scopes, ctx, { identity: normalizedIdentity });
+      let check;
+      if (authReason === "user_grant") {
+        check = await checkUserGrant(openId, userRequiredScopes, ctx, { acceptEmptyMissing: true });
+      } else {
+        check = await checkScopes(scopes, ctx, { identity: normalizedIdentity });
+      }
       if (!isActive()) return;
       if (authReason === "user_grant") {
         fileLog(`waitForAuth: "${skillName}" user grant poll result ${formatGrantCheckForLog(check, { acceptEmptyMissing: true })}`);

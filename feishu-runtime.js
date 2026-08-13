@@ -28,9 +28,18 @@ function toHttpsOrigin(value) {
 }
 
 export function resolveFeishuBrand(domain) {
-  const normalized = String(domain || "").toLowerCase();
+  const normalized = String(domain || "").trim().toLowerCase();
   if (normalized === "lark") return "lark";
-  if (normalized.includes("larksuite")) return "lark";
+  const origin = toHttpsOrigin(normalized);
+  const hostname = origin ? new URL(origin).hostname.toLowerCase() : normalized.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  if (
+    hostname === "lark.com" ||
+    hostname === "larksuite.com" ||
+    hostname.endsWith(".lark.com") ||
+    hostname.endsWith(".larksuite.com")
+  ) {
+    return "lark";
+  }
   return "feishu";
 }
 
@@ -113,7 +122,6 @@ export async function beginScopeGrantFlow({ appId, brand, scopes, identity = "us
     interval: payload.interval || 5,
   };
 }
-
 
 export async function getTenantAccessToken(credentials) {
   const cacheKey = `${credentials.appId}::${credentials.appSecret}::${credentials.domain || ""}`;
