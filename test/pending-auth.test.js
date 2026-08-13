@@ -116,7 +116,7 @@ test("getPendingAuthNoticeStorePath prefers a stable OpenClaw data directory ove
     tmpDir: "/tmp/ignored",
   });
 
-  assert.equal(filePath, "/var/lib/openclaw-data/plugins/openclaw-skill-runtime/pending-auth-notices.json");
+  assert.equal(filePath, join("/var/lib/openclaw-data", "plugins", "openclaw-skill-runtime", "pending-auth-notices.json"));
 });
 
 test("readPendingAuthNoticeStore restores retrying notices and prunes stale exhausted ones", () => {

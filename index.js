@@ -206,13 +206,16 @@ export function createPluginEntry(overrides = {}) {
   }
 
   // Only inspect actual user messages. OpenClaw's assembled prompt contains every
-  // installed Skill name, so using event.prompt here would incorrectly preflight all
-  // Skills on every conversation turn.
+  // installed Skill name, and event.messages may contain conversation history, so
+  // only the latest user message should trigger explicit skill preflight.
   function findExplicitSkillNames(event, skillMap) {
-    const userText = (Array.isArray(event?.messages) ? event.messages : [])
-      .filter((message) => String(message?.role || "").toLowerCase() === "user")
-      .map((message) => readMessageText(message?.content ?? message))
-      .join("\n");
+    const messages = Array.isArray(event?.messages) ? event.messages : [];
+    const latestUserMessage = [...messages]
+      .reverse()
+      .find((message) => String(message?.role || "").toLowerCase() === "user");
+    const userText = latestUserMessage
+      ? readMessageText(latestUserMessage?.content ?? latestUserMessage)
+      : "";
     if (!userText) return [];
     return [...new Set([...skillMap.values()].filter((skillName) => userText.includes(skillName)))];
   }
@@ -239,6 +242,11 @@ export function createPluginEntry(overrides = {}) {
     // 插件私有配置在 api.pluginConfig（不是 api.config）
     const cfg = api.pluginConfig || {};
     setPluginApiRef(api);
+    const availableTools = Object.keys(api.tools || {}).sort();
+    const authDebugTools = availableTools.filter((name) =>
+      /check_user_grant|feishu|lark/i.test(name),
+    );
+    fileLog(`register: availableTools=${availableTools.length} authDebugTools=${authDebugTools.join(",") || "<none>"}`);
     resetRuntimeCaches();
     if (cfg.enabled === false) { fileLog("disabled by config"); return; }
     const blockRead = cfg.blockRead !== false;
@@ -321,6 +329,37 @@ export function createPluginEntry(overrides = {}) {
         block: true,
         reason: `技能「${skillName}」正在等待飞书授权完成，暂不执行后续操作。请完成授权后重试。`,
       };
+    }
+
+    function isFeishuLarkToolName(toolName) {
+      return /(^|[_:.-])(feishu|lark)([_:.-]|$)/i.test(String(toolName || ""));
+    }
+
+    function getToolCommandText(event) {
+      const params = event?.params || {};
+      const value = params.command ?? params.cmd ?? params.script ?? event?.command;
+      if (Array.isArray(value)) return value.join(" ");
+      return typeof value === "string" ? value : "";
+    }
+
+    function isLarkCliCommand(event) {
+      const command = getToolCommandText(event);
+      return /(^|[\s"'`;&|()\\/])(?:lark-cli(?:\.(?:cmd|exe))?|feishu-lark-cli)(?=$|[\s"'`;&|()\\/])/i.test(command);
+    }
+
+    function isProtectedPendingAuthOperation(event, pendingGate, directTarget, skillNameCandidates) {
+      const pendingSkillName = normalizeSkillName(pendingGate?.skillName);
+      if (!pendingSkillName) return false;
+      if (normalizeSkillName(directTarget?.skillName) === pendingSkillName) return true;
+      if (skillNameCandidates.includes(pendingSkillName)) return true;
+      if (isFeishuLarkToolName(event?.toolName)) return true;
+      if (isLarkCliCommand(event)) return true;
+      return false;
+    }
+
+    function hasExplicitRetryIntent(ctx, skillName) {
+      return ctx?.authIntent?.type === "explicit_skill_retry"
+        && normalizeSkillName(ctx.authIntent.skillName) === normalizeSkillName(skillName);
     }
 
     function persistPendingAuthNotices() {
@@ -551,6 +590,7 @@ export function createPluginEntry(overrides = {}) {
           if (latest?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
         }
       }, delayMs);
+      timer?.unref?.();
       pendingAuthRetryTimers.set(authTargetKey, timer);
     }
 
@@ -603,6 +643,7 @@ export function createPluginEntry(overrides = {}) {
             params: { path: skillPath },
           }, {
             ...ctx,
+            authIntent: { type: "explicit_skill_retry", skillName },
             skillCommand: { skillName },
           });
           if (result?.block) return result;
@@ -640,7 +681,11 @@ export function createPluginEntry(overrides = {}) {
         const skillNameCandidates = collectSkillNameCandidates(event, ctx, directTarget);
         const isReadTool = event.toolName === "read";
         const pendingGate = getAuthExecutionGate(event, ctx);
-        if (pendingGate && !skillNameCandidates.includes(pendingGate.skillName)) {
+        if (pendingGate && skillNameCandidates.includes(pendingGate.skillName) && !hasExplicitRetryIntent(ctx, pendingGate.skillName)) {
+          fileLog(`auth gate held tool=${event?.toolName || ""} skill="${pendingGate.skillName}"`);
+          return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
+        }
+        if (pendingGate && !skillNameCandidates.includes(pendingGate.skillName) && isProtectedPendingAuthOperation(event, pendingGate, directTarget, skillNameCandidates)) {
           fileLog(`auth gate blocked tool=${event?.toolName || ""} skill="${pendingGate.skillName}"`);
           return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
         }
@@ -827,9 +872,9 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
         }
         if (cache && cache.requesterKey === requesterKey && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
-          if (!cache.retryConsumed) {
+          if (!cache.retryConsumed && hasExplicitRetryIntent(ctx, skillName)) {
             skillAuthCache.set(authTargetKey, { ...cache, retryConsumed: true });
-            fileLog(`retry: authTargetKey="${authTargetKey}" explicit retry allowed during cooldown`);
+            fileLog(`retry: authTargetKey="${authTargetKey}" explicit user retry allowed during cooldown`);
           } else {
             fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
             return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;

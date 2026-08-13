@@ -1,6 +1,6 @@
 {
   "name": "@jianguo_paper/openclaw-skill-runtime",
-  "version": "2.0.6",
+  "version": "0.11.0",
   "description": "OpenClaw plugin that pre-authorizes Feishu scopes declared by SKILL.md before skill use.",
   "type": "module",
   "main": "index.js",
@@ -9,7 +9,9 @@
   },
   "files": [
     "bin",
-    "docs",
+    "docs/openclaw-gateway-notes.md",
+    "docs/superpowers/plans/2026-08-01-oauth-server-verification.md",
+    "docs/superpowers/specs/2026-08-01-oauth-server-verification-design.md",
     "feishu-runtime.js",
     "index.js",
     "openclaw.plugin.json",

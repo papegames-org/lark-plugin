@@ -75,7 +75,9 @@ function runNpmPack({ pkgDir, destDir, dryRun }) {
   if (dryRun) argv.push("--dry-run");
   argv.push(pkgDir);
 
-  const result = spawnSync("npm", argv, {
+  const npmCommand = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "npm";
+  const npmArgs = process.platform === "win32" ? ["/d", "/s", "/c", "npm.cmd", ...argv] : argv;
+  const result = spawnSync(npmCommand, npmArgs, {
     cwd,
     env,
     encoding: "utf8",
@@ -102,7 +104,7 @@ function extractPackedFilename(output) {
     .map((s) => s.trim())
     .filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    if (lines[i].endsWith(".tgz")) return lines[i];
+    if (lines[i].endsWith(".tgz")) return lines[i].split(/\s+/).at(-1);
   }
   return null;
 }

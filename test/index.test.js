@@ -208,7 +208,59 @@ test("before_prompt_build preflights an explicitly named skill and sends its aut
   assert.equal(captured.cards[0].openId, "ou_prompt_preflight");
 });
 
-test("before_tool_call allows one replacement auth card during the cooldown", async () => {
+test("before_prompt_build ignores skill names from older user messages", async () => {
+  const handlers = new Map();
+  const captured = { cards: [] };
+  const plugin = createPluginEntry({
+    fileLog() {},
+    logCtxSnapshotOnce() {},
+    setApiConfigRef() {},
+    setPluginApiRef() {},
+    resetRuntimeCaches() {},
+    getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-prompt-history.json"; },
+    readPendingAuthNoticeStore() { return new Map(); },
+    writePendingAuthNoticeStore() {},
+    buildSkillRootsCacheKey() { return "test-roots"; },
+    getDefaultSkillRoots() { return []; },
+    buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-basic"]]); },
+    cachedAccountBySession: new Map(),
+    cachedWorkspaceBySession: new Map(),
+    cacheSenderId() {},
+    getCachedSenderId() { return "ou_prompt_history"; },
+    resolveWorkspaceDir() { return null; },
+    ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+    checkScopes: async () => ({ ok: false, missing: ["contact:user.base:readonly"], granted: [] }),
+    startLogin: async () => ({ verificationUrl: "https://example.com/auth", userCode: "PROMPT", deviceCode: "PROMPT_DEVICE" }),
+    getAuthedUser: async () => ({ openId: "ou_prompt_history" }),
+    sendAuthCard: async (payload) => {
+      captured.cards.push(payload);
+      return { messageId: "msg_prompt_history" };
+    },
+    startWaitForAuth() {},
+  });
+
+  plugin.register({
+    config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+    pluginConfig: { enabled: true, blockRead: true },
+    log: { info() {}, warn() {} },
+    on(name, handler) { handlers.set(name, handler); },
+  });
+
+  await handlers.get("before_prompt_build")(
+    {
+      messages: [
+        { role: "user", content: "请定位 feishu-auth-basic 授权卡问题" },
+        { role: "assistant", content: "好的" },
+        { role: "user", content: "你好" },
+      ],
+    },
+    { channel: "feishu", accountId: "acc-a", sessionId: "prompt-history", sessionKey: "prompt-history" },
+  );
+
+  assert.equal(captured.cards.length, 0);
+});
+
+test("before_tool_call deduplicates replacement auth cards during the cooldown", async () => {
   const handlers = new Map();
   const captured = { loginCount: 0, cards: [] };
   const plugin = createPluginEntry({
@@ -259,8 +311,8 @@ test("before_tool_call allows one replacement auth card during the cooldown", as
   assert.equal(first?.block, true);
   assert.equal(second?.block, true);
   assert.equal(third?.block, true);
-  assert.equal(captured.loginCount, 2);
-  assert.equal(captured.cards.length, 2);
+  assert.equal(captured.loginCount, 1);
+  assert.equal(captured.cards.length, 1);
 });
 
 test("before_tool_call can resolve the test skill from ctx.skillCommand when read path is unavailable", async () => {
@@ -650,7 +702,7 @@ test("before_tool_call sends user-grant card when app scopes are open but user g
   assert.equal(afterUserGrant?.block, true);
 });
 
-test("before_tool_call allows one user-grant card retry after background app-scope poll sends one", async () => {
+test("before_tool_call deduplicates a user-grant card after background app-scope poll sends one", async () => {
   const handlers = new Map();
   const scopes = ["aily:data_asset:upload_file", "base:block:create"];
   const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
@@ -717,7 +769,7 @@ test("before_tool_call allows one user-grant card retry after background app-sco
 
   const second = await handlers.get("before_tool_call")(event, ctx);
   assert.equal(second?.block, true);
-  assert.equal(captured.sendAuthCard.length, 2);
+  assert.equal(captured.sendAuthCard.length, 1);
 });
 test("before_tool_call allows user identity skill when user grant scopes are verified", async () => {
   const handlers = new Map();
@@ -1125,7 +1177,7 @@ test("before_tool_call allows app identity skill when app identity scopes are op
   assert.equal(result, undefined);
 });
 
-test("before_tool_call blocks later untagged tool calls while authorization is pending", async () => {
+test("before_tool_call blocks only protected operations while authorization is pending", async () => {
   const handlers = new Map();
   let authWaiter = null;
   const plugin = createPluginEntry({
@@ -1162,14 +1214,34 @@ test("before_tool_call blocks later untagged tool calls while authorization is p
 
   const ctx = { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate", skillCommand: { skillName: "feishu-auth-basic" } };
   const authResult = await handlers.get("before_tool_call")({ toolName: "read", params: { path: basicSkillPath } }, ctx);
-  const laterResult = await handlers.get("before_tool_call")(
-    { toolName: "exec", params: { command: "echo must-not-run" } },
+  const sessionStatusResult = await handlers.get("before_tool_call")(
+    { toolName: "session_status", params: {} },
+    { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
+  );
+  const normalReadResult = await handlers.get("before_tool_call")(
+    { toolName: "read", params: { path: "/tmp/not-a-skill.txt" } },
+    { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
+  );
+  const normalExecResult = await handlers.get("before_tool_call")(
+    { toolName: "exec", params: { command: "echo can-run" } },
+    { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
+  );
+  const larkCliExecResult = await handlers.get("before_tool_call")(
+    { toolName: "exec", params: { command: "lark-cli config list" } },
+    { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
+  );
+  const pendingSkillReadResult = await handlers.get("before_tool_call")(
+    { toolName: "read", params: { path: basicSkillPath } },
     { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
   );
 
   assert.equal(authResult?.block, true);
-  assert.equal(laterResult?.block, true);
-  assert.match(laterResult?.reason || "", /授权/);
+  assert.equal(sessionStatusResult, undefined);
+  assert.equal(normalReadResult, undefined);
+  assert.equal(normalExecResult, undefined);
+  assert.equal(larkCliExecResult?.block, true);
+  assert.match(larkCliExecResult?.reason || "", /授权/);
+  assert.equal(pendingSkillReadResult?.block, true);
 
   await authWaiter.onAuthorized({
     authTargetKey: authWaiter.authTargetKey,
@@ -1181,6 +1253,78 @@ test("before_tool_call blocks later untagged tool calls while authorization is p
     { channel: "feishu", accountId: "acc-a", sessionId: "session-pending-gate" },
   );
   assert.equal(afterAuthorized, undefined);
+});
+
+test("before_tool_call does not resend a pending skill auth card from implicit same-skill reads", async () => {
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+
+  try {
+    const handlers = new Map();
+    const captured = { checks: 0, logins: 0, cards: 0 };
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      setPluginApiRef() {},
+      resetRuntimeCaches() {},
+      getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-implicit-pending-read.json"; },
+      readPendingAuthNoticeStore() { return new Map(); },
+      writePendingAuthNoticeStore() {},
+      buildSkillRootsCacheKey() { return "test-roots"; },
+      getDefaultSkillRoots() { return []; },
+      buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-basic"]]); },
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      cacheSenderId() {},
+      getCachedSenderId() { return "ou_implicit_pending_123"; },
+      resolveWorkspaceDir() { return null; },
+      ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+      checkScopes: async () => {
+        captured.checks += 1;
+        return { ok: false, missing: ["contact:user.base:readonly"], granted: [] };
+      },
+      startLogin: async () => {
+        captured.logins += 1;
+        return { verificationUrl: "https://example.com/auth", deviceCode: `DEVICE_${captured.logins}` };
+      },
+      getAuthedUser: async () => ({ openId: "ou_implicit_pending_123" }),
+      sendAuthCard: async () => {
+        captured.cards += 1;
+        return { messageId: `msg_implicit_${captured.cards}` };
+      },
+      startWaitForAuth() {},
+    });
+
+    plugin.register({
+      config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+      pluginConfig: { enabled: true, blockRead: true },
+      log: { info() {}, warn() {} },
+      on(name, handler) { handlers.set(name, handler); },
+    });
+
+    const read = { toolName: "read", params: { path: basicSkillPath } };
+    const ctx = { channel: "feishu", accountId: "acc-a", sessionId: "session-implicit-pending", skillCommand: { skillName: "feishu-auth-basic" } };
+
+    const first = await handlers.get("before_tool_call")(read, ctx);
+    assert.equal(first?.block, true);
+    assert.deepEqual(captured, { checks: 1, logins: 1, cards: 1 });
+
+    now += 181_000;
+    const implicitSameSkillRead = await handlers.get("before_tool_call")(read, ctx);
+    assert.equal(implicitSameSkillRead?.block, true);
+    assert.deepEqual(captured, { checks: 1, logins: 1, cards: 1 });
+
+    const explicitRetry = await handlers.get("before_tool_call")(read, {
+      ...ctx,
+      authIntent: { type: "explicit_skill_retry", skillName: "feishu-auth-basic" },
+    });
+    assert.equal(explicitRetry?.block, true);
+    assert.deepEqual(captured, { checks: 2, logins: 2, cards: 2 });
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("before_tool_call keeps concurrent users' authorization gates and retry notices isolated", async () => {
@@ -1222,7 +1366,7 @@ test("before_tool_call keeps concurrent users' authorization gates and retry not
   assert.equal(resultB?.block, true);
   assert.equal(loginCalls, 2, "B must not inherit A's pending notice and skip its own authorization attempt");
   assert.deepEqual(persisted.at(-1), ["ou_b"], "the reused storage key is rebound to B rather than retaining A's notice");
-  const laterB = await handlers.get("before_tool_call")({ toolName: "exec", params: { command: "echo blocked" } }, ctxB);
+  const laterB = await handlers.get("before_tool_call")({ toolName: "exec", params: { command: "lark-cli config list" } }, ctxB);
   assert.equal(laterB?.block, true, "a different user's pending authorization cannot clear B's gate");
 });
 
@@ -1245,7 +1389,7 @@ test("authorization completion for user A cannot clear user B's execution gate",
   await handlers.get("before_tool_call")(read, ctxA);
   await handlers.get("before_tool_call")(read, ctxB);
   await waiters[0].onAuthorized({ authTargetKey: waiters[0].authTargetKey, missingKey: waiters[0].missingKey, authReason: "user_grant" });
-  const laterB = await handlers.get("before_tool_call")({ toolName: "exec", params: { command: "echo blocked" } }, ctxB);
+  const laterB = await handlers.get("before_tool_call")({ toolName: "exec", params: { command: "lark-cli config list" } }, ctxB);
   assert.equal(laterB?.block, true);
 });
 
