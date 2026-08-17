@@ -198,10 +198,10 @@ test("before_prompt_build preflights an explicitly named skill and sends its aut
     on(name, handler) { handlers.set(name, handler); },
   });
 
-  await handlers.get("before_prompt_build")(
-    { messages: [{ role: "user", content: "请执行 feishu-auth-basic skill" }] },
-    { channel: "feishu", accountId: "acc-a", sessionId: "prompt-session", sessionKey: "prompt-session" },
-  );
+  const event = { messages: [{ role: "user", content: "请执行 feishu-auth-basic skill" }] };
+  const ctx = { channel: "feishu", accountId: "acc-a", sessionId: "prompt-session", sessionKey: "prompt-session" };
+  await handlers.get("before_prompt_build")(event, ctx);
+  await handlers.get("before_prompt_build")(event, ctx);
 
   assert.equal(captured.cards.length, 1);
   assert.equal(captured.cards[0].skillName, "feishu-auth-basic");
@@ -1325,6 +1325,109 @@ test("before_tool_call does not resend a pending skill auth card from implicit s
   } finally {
     Date.now = originalNow;
   }
+});
+
+test("authorization timeout ignores stale skill metadata until the skill is triggered again", async () => {
+  const handlers = new Map();
+  const captured = { cards: 0, waiters: [] };
+  const plugin = createPluginEntry({
+    fileLog() {}, logCtxSnapshotOnce() {}, setApiConfigRef() {}, setPluginApiRef() {}, resetRuntimeCaches() {},
+    getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-timeout-stale-metadata.json"; },
+    readPendingAuthNoticeStore() { return new Map(); },
+    writePendingAuthNoticeStore() {},
+    buildSkillRootsCacheKey() { return "test-roots"; },
+    getDefaultSkillRoots() { return []; },
+    buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-basic"]]); },
+    cachedAccountBySession: new Map(), cachedWorkspaceBySession: new Map(), cacheSenderId() {},
+    getCachedSenderId() { return "ou_timeout_stale"; }, resolveWorkspaceDir() { return null; },
+    ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+    checkScopes: async () => ({ ok: false, missing: ["contact:user.base:readonly"], granted: [] }),
+    startLogin: async () => ({ verificationUrl: "https://example.com/auth", deviceCode: "DEVICECODE" }),
+    getAuthedUser: async () => ({ openId: "ou_timeout_stale" }),
+    sendAuthCard: async () => ({ messageId: `msg_${++captured.cards}` }),
+    startWaitForAuth(payload) { captured.waiters.push(payload); },
+  });
+
+  plugin.register({
+    config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+    pluginConfig: { enabled: true, blockRead: true },
+    log: { info() {}, warn() {} },
+    on(name, handler) { handlers.set(name, handler); },
+  });
+
+  const ctx = {
+    channel: "feishu",
+    accountId: "acc-a",
+    sessionId: "session-timeout-stale",
+    senderId: "ou_timeout_stale",
+  };
+  const read = { toolName: "read", params: { path: basicSkillPath } };
+
+  await handlers.get("before_tool_call")(read, ctx);
+  assert.equal(captured.cards, 1);
+
+  await captured.waiters[0].onTimeout({
+    authTargetKey: captured.waiters[0].authTargetKey,
+    skillName: "feishu-auth-basic",
+  });
+
+  const staleResult = await handlers.get("before_tool_call")(
+    { toolName: "exec", params: { command: "echo hello" } },
+    { ...ctx, trace: { skillCommand: { skillName: "feishu-auth-basic" } } },
+  );
+  assert.equal(staleResult, undefined);
+  assert.equal(captured.cards, 1);
+
+  await handlers.get("before_tool_call")(read, ctx);
+  assert.equal(captured.cards, 2);
+});
+
+test("concurrent skill hooks share one login, authorization card, and poller", async () => {
+  const handlers = new Map();
+  const captured = { logins: 0, cards: 0, pollers: 0 };
+  const plugin = createPluginEntry({
+    fileLog() {}, logCtxSnapshotOnce() {}, setApiConfigRef() {}, setPluginApiRef() {}, resetRuntimeCaches() {},
+    getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-concurrent-card.json"; },
+    readPendingAuthNoticeStore() { return new Map(); }, writePendingAuthNoticeStore() {},
+    buildSkillRootsCacheKey() { return "test-roots"; }, getDefaultSkillRoots() { return []; },
+    buildSkillMap() { return new Map([[basicSkillPath, "feishu-auth-basic"]]); },
+    cachedAccountBySession: new Map(), cachedWorkspaceBySession: new Map(), cacheSenderId() {},
+    getCachedSenderId() { return "ou_concurrent_card"; }, resolveWorkspaceDir() { return null; },
+    ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+    checkScopes: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { ok: false, missing: ["contact:user.base:readonly"], granted: [] };
+    },
+    startLogin: async () => {
+      captured.logins += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { verificationUrl: "https://example.com/auth", deviceCode: "DEVICECODE" };
+    },
+    getAuthedUser: async () => ({ openId: "ou_concurrent_card" }),
+    sendAuthCard: async () => {
+      captured.cards += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { messageId: "msg_concurrent_card" };
+    },
+    startWaitForAuth() { captured.pollers += 1; },
+  });
+
+  plugin.register({
+    config: { channels: { feishu: { accounts: { "acc-a": { appId: "cli_test", appSecret: "secret_test" } } } } },
+    pluginConfig: { enabled: true, blockRead: true }, log: { info() {}, warn() {} },
+    on(name, handler) { handlers.set(name, handler); },
+  });
+
+  const event = { toolName: "read", params: { path: basicSkillPath } };
+  const ctx = { channel: "feishu", accountId: "acc-a", sessionId: "session-concurrent-card", senderId: "ou_concurrent_card" };
+  const [first, second] = await Promise.all([
+    handlers.get("before_tool_call")(event, ctx),
+    handlers.get("before_tool_call")(event, ctx),
+  ]);
+
+  assert.equal(first?.block, true);
+  assert.equal(second?.block, true);
+  assert.deepEqual(captured, { logins: 1, cards: 1, pollers: 1 });
 });
 
 test("before_tool_call keeps concurrent users' authorization gates and retry notices isolated", async () => {

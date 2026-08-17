@@ -1552,12 +1552,14 @@ test("startWaitForAuth keeps an unavailable OAuth runtime blocked when its waite
 
 test("startWaitForAuth updates an app-scope card when authorization times out", async () => {
   const updates = [];
+  const events = [];
   const originalDateNow = Date.now;
   let nowCalls = 0;
   Date.now = () => (nowCalls++ === 0 ? 0 : 180001);
   setPluginApiRef({
     tools: {
       async feishu_im_user_message(payload) {
+        events.push("card-update");
         updates.push(payload);
         return { success: true };
       },
@@ -1576,10 +1578,14 @@ test("startWaitForAuth updates an app-scope card when authorization times out", 
       authReason: "app_scope",
       ctx: { accountId: "acc-a" },
       authMessageId: "msg_timeout",
+      onTimeout() {
+        events.push("timeout-release");
+      },
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     assert.equal(updates.length, 1);
+    assert.deepEqual(events, ["timeout-release", "card-update"]);
     assert.equal(updates[0].action, "update");
     const card = JSON.parse(updates[0].content);
     assert.match(card.header.title.content, /应用权限开通超时/);

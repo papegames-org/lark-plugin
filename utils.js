@@ -1602,6 +1602,7 @@ export function startWaitForAuth({
   authWaiter = null,
   onAuthorized = null,
   onAuthCardSent = null,
+  onTimeout = null,
 }) {
   if (!deviceCode && authReason === "user_grant") return;
   // 如果该技能已有轮询在跑，先清理旧的，避免重复
@@ -1652,6 +1653,23 @@ export function startWaitForAuth({
         fileLog(
           `waitForAuth: "${skillName}" timed out after ${Math.round(elapsed / 1000)}s`,
         );
+        cleanup();
+        if (typeof onTimeout === "function") {
+          try {
+            await onTimeout({
+              authTargetKey,
+              skillName,
+              missingKey,
+              openId,
+              scopes,
+              identity: normalizeAuthIdentity(identity),
+              authReason,
+              ctx,
+            });
+          } catch (callbackError) {
+            fileLog(`waitForAuth: onTimeout callback failed for "${skillName}": ${callbackError?.message || callbackError}`);
+          }
+        }
         if (authMessageId) {
           fileLog(`waitForAuth: updating timed-out auth card skill="${skillName}" authReason=${authReason} msg=${authMessageId}`);
           await updateAuthFailureCard({
@@ -1662,7 +1680,6 @@ export function startWaitForAuth({
             authReason,
           });
         }
-        cleanup();
         return;
       }
 
@@ -1774,6 +1791,7 @@ export function startWaitForAuth({
                 authWaiter: login.authWaiter,
                 onAuthorized,
                 onAuthCardSent,
+                onTimeout,
               });
               return;
             }

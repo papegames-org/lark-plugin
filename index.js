@@ -292,6 +292,8 @@ export function createPluginEntry(overrides = {}) {
     // OpenClaw may invoke the skill's next tool without preserving skill metadata.
     // Keep a session-local gate until the background authorization check succeeds.
     const pendingAuthExecutionGates = new Map();
+    const timedOutAuthTargetsBySession = new Map();
+    const authCardFlowLeases = new Map();
 
     function getSessionGateKeys(event, ctx) {
       return [...new Set([
@@ -322,6 +324,41 @@ export function createPluginEntry(overrides = {}) {
           pendingAuthExecutionGates.delete(sessionKey);
         }
       }
+    }
+
+    function getTimedOutAuthTarget(event, ctx) {
+      for (const sessionKey of getSessionGateKeys(event, ctx)) {
+        const target = timedOutAuthTargetsBySession.get(sessionKey);
+        if (target) return target;
+      }
+      return null;
+    }
+
+    function clearTimedOutAuthTarget(authTargetKey, event, ctx) {
+      for (const sessionKey of getSessionGateKeys(event, ctx)) {
+        if (timedOutAuthTargetsBySession.get(sessionKey)?.authTargetKey === authTargetKey) {
+          timedOutAuthTargetsBySession.delete(sessionKey);
+        }
+      }
+    }
+
+    function markAuthTimedOut(details, event, ctx, requesterKey) {
+      const authTargetKey = details?.authTargetKey;
+      if (!authTargetKey) return;
+      clearAuthExecutionGates(authTargetKey, requesterKey);
+      clearPendingAuthNotice(authTargetKey);
+      const cache = skillAuthCache.get(authTargetKey);
+      if (!requesterKey || !cache?.requesterKey || cache.requesterKey === requesterKey) {
+        skillAuthCache.delete(authTargetKey);
+      }
+      for (const sessionKey of getSessionGateKeys(event, ctx)) {
+        timedOutAuthTargetsBySession.set(sessionKey, {
+          authTargetKey,
+          skillName: details?.skillName || null,
+          requesterKey,
+        });
+      }
+      fileLog(`auth timeout released authTargetKey="${authTargetKey}" skill="${details?.skillName || "<unknown>"}"`);
     }
 
     function blockForPendingAuthorization(skillName) {
@@ -761,6 +798,18 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: matched skillName="${skillName}" but could not resolve SKILL.md path`);
           return;
         }
+        const isConcreteSkillRead = isReadTool && Boolean(
+          (abs && skillMapEntry.map.get(abs) === skillName)
+          || directTarget?.skillName === skillName,
+        );
+        const timedOutTarget = getTimedOutAuthTarget(event, ctx);
+        if (timedOutTarget?.skillName === skillName) {
+          if (!isConcreteSkillRead && !hasExplicitRetryIntent(ctx, skillName)) {
+            fileLog(`skip: stale skill metadata after timeout tool=${event?.toolName || ""} skill="${skillName}"`);
+            return;
+          }
+          clearTimedOutAuthTarget(timedOutTarget.authTargetKey, event, ctx);
+        }
         const larkAuth = readLarkAuth(skillPath);
         if (!larkAuth || !larkAuth.scopes.length) return;
         guardedSkillName = skillName;
@@ -872,70 +921,85 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
         }
         if (cache && cache.requesterKey === requesterKey && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
-          if (!cache.retryConsumed && hasExplicitRetryIntent(ctx, skillName)) {
-            skillAuthCache.set(authTargetKey, { ...cache, retryConsumed: true });
-            fileLog(`retry: authTargetKey="${authTargetKey}" explicit user retry allowed during cooldown`);
-          } else {
-            fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
-            return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;
-          }
+          fileLog(`skip: authTargetKey="${authTargetKey}" cooldown active (${Math.round((now - cache.lastSentAtMs) / 1000)}s ago)`);
+          return blockRead ? { block: true, reason: `技能「${skillName}」需要飞书权限授权，上次已发送授权卡片，请完成授权后重试。` } : undefined;
         }
 
-        let loginError = null;
         const oauthState = authReason === "user_grant" ? userGrantCheck?.oauthState || null : null;
         const loginScopes = authReason === "user_grant" ? larkAuth.scopes : missing;
-        const login = await startLogin(loginScopes, ctx, { identity, authReason, oauthState });
-        if (login.verificationUrl) {
-          const user = resolvedUser || await getAuthedUser(ctx);
-          const recipient = resolveAuthCardRecipient(ctx);
-          const sent = await sendAuthCard({
-            skillName,
-            missing,
-            ...login,
-            openId: user?.openId,
-            receiveId: recipient?.receiveId || null,
-            receiveIdType: recipient?.receiveIdType || null,
-            accountId: resolvedAccountId,
-            identity,
-            authReason,
-            ...(oauthState ? { oauthState } : {}),
-          });
-          if (sent.messageId) {
-            clearPendingAuthNotice(authTargetKey);
-            skillAuthCache.set(authTargetKey, {
-              missingKey,
-              lastSentAtMs: now,
-              requesterKey,
-              retryConsumed: skillAuthCache.get(authTargetKey)?.retryConsumed === true,
-            });
-            const mode = blockRead ? "(blocked)" : "";
-            fileLog(`auth card ${mode} "${skillName}" sent msg=${sent.messageId}`);
-            startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, requiredScopes: larkAuth.scopes, identity, authReason, ...(oauthState ? { oauthState } : {}), ctx, authMessageId: sent.messageId, authWaiter: login.authWaiter, onAuthorized: (details) => markSkillAuthAuthorized({ ...details, requesterKey }), onAuthCardSent: (details) => markSkillAuthCardSent({ ...details, requesterKey }) });
-          } else {
-            fileLog(`sendAuthCard failed: ${sent.error}`);
-            const notice = recordPendingAuthFailure({
-              authTargetKey,
+        const flowLeaseKey = `${authTargetKey}\u0000${requesterKey || "<none>"}\u0000${missingKey}`;
+        let authFlow = authCardFlowLeases.get(flowLeaseKey);
+        if (authFlow) {
+          fileLog(`auth card flow reused authTargetKey="${authTargetKey}" skill="${skillName}"`);
+        } else {
+          authFlow = (async () => {
+            const login = await startLogin(loginScopes, ctx, { identity, authReason, oauthState });
+            if (!login.verificationUrl) {
+              const loginError = login?.error || "startLogin failed";
+              fileLog(`startLogin failed "${skillName}": ${loginError}`);
+              return { loginError };
+            }
+
+            const user = resolvedUser || await getAuthedUser(ctx);
+            const recipient = resolveAuthCardRecipient(ctx);
+            const sent = await sendAuthCard({
               skillName,
-              skillPath,
-              accountId: resolvedAccountId,
-              openId: user?.openId || null,
-              receiveId: recipient?.receiveId || user?.openId || null,
-              receiveIdType: recipient?.receiveIdType || (user?.openId ? "open_id" : null),
               missing,
-              requiredScopes: larkAuth.scopes,
-              missingKey,
+              ...login,
+              openId: user?.openId,
+              receiveId: recipient?.receiveId || null,
+              receiveIdType: recipient?.receiveIdType || null,
+              accountId: resolvedAccountId,
               identity,
               authReason,
-              requesterKey,
               ...(oauthState ? { oauthState } : {}),
-              lastError: sent.error || "send failed",
             });
-            if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
-          }
-        } else {
-          loginError = login?.error || "startLogin failed";
-          fileLog(`startLogin failed "${skillName}": ${loginError}`);
+            if (sent.messageId) {
+              clearPendingAuthNotice(authTargetKey);
+              skillAuthCache.set(authTargetKey, {
+                missingKey,
+                lastSentAtMs: now,
+                requesterKey,
+                retryConsumed: skillAuthCache.get(authTargetKey)?.retryConsumed === true,
+              });
+              const mode = blockRead ? "(blocked)" : "";
+              fileLog(`auth card ${mode} "${skillName}" sent msg=${sent.messageId}`);
+              startWaitForAuth({ authTargetKey, skillName, deviceCode: login.deviceCode, missingKey, openId: user?.openId, scopes: missing, requiredScopes: larkAuth.scopes, identity, authReason, ...(oauthState ? { oauthState } : {}), ctx, authMessageId: sent.messageId, authWaiter: login.authWaiter, onAuthorized: (details) => markSkillAuthAuthorized({ ...details, requesterKey }), onAuthCardSent: (details) => markSkillAuthCardSent({ ...details, requesterKey }), onTimeout: (details) => markAuthTimedOut(details, event, ctx, requesterKey) });
+            } else {
+              fileLog(`sendAuthCard failed: ${sent.error}`);
+              const notice = recordPendingAuthFailure({
+                authTargetKey,
+                skillName,
+                skillPath,
+                accountId: resolvedAccountId,
+                openId: user?.openId || null,
+                receiveId: recipient?.receiveId || user?.openId || null,
+                receiveIdType: recipient?.receiveIdType || (user?.openId ? "open_id" : null),
+                missing,
+                requiredScopes: larkAuth.scopes,
+                missingKey,
+                identity,
+                authReason,
+                requesterKey,
+                ...(oauthState ? { oauthState } : {}),
+                lastError: sent.error || "send failed",
+              });
+              if (notice?.status === "retrying") schedulePendingAuthRetry(authTargetKey);
+            }
+            return { loginError: null };
+          })();
+          authCardFlowLeases.set(flowLeaseKey, authFlow);
         }
+
+        let flowResult;
+        try {
+          flowResult = await authFlow;
+        } finally {
+          if (authCardFlowLeases.get(flowLeaseKey) === authFlow) {
+            authCardFlowLeases.delete(flowLeaseKey);
+          }
+        }
+        const loginError = flowResult?.loginError || null;
         // 无论发卡是否成功，只要 blockRead=true 且 scopes 缺失，一律拦截 read，
         // 防止模型拿到 SKILL.md 内容后绕过授权直接执行 skill。
         if (blockRead) {
