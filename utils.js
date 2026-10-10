@@ -2,7 +2,14 @@
 // 包含：日志、workspace 查找、skill-map 构建、auth 操作等（frontmatter 解析已移至 parse-meta.js）
 // ============================================================
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
@@ -1327,9 +1334,35 @@ export async function checkUserGrant(openId, scopes, ctx, options = {}) {
   }
 }
 
-export async function ensureFeishuRuntimeHealth() {
+export async function ensureFeishuRuntimeHealth(ctx) {
   if (runtimeHealthCache) return runtimeHealthCache;
-  runtimeHealthCache = getAccountCredentials({})
+  runtimeHealthCache = getAccountCredentials(ctx || {}).catch(() => {
+    // fallback: multi-account with empty ctx — try first available account
+    const cfg = apiConfigRef;
+    const feishuCfg = cfg?.channels?.feishu || {};
+    const accounts =
+      feishuCfg.accounts && typeof feishuCfg.accounts === "object"
+        ? feishuCfg.accounts
+        : {};
+    for (const [aid, acc] of Object.entries(accounts)) {
+      const merged = { ...feishuCfg, ...acc };
+      if (merged.appId && merged.appSecret) {
+        return {
+          accountId: aid,
+          appId: String(merged.appId),
+          appSecret: String(merged.appSecret),
+        };
+      }
+    }
+    if (feishuCfg.appId && feishuCfg.appSecret) {
+      return {
+        accountId: "default",
+        appId: String(feishuCfg.appId),
+        appSecret: String(feishuCfg.appSecret),
+      };
+    }
+    throw new Error("feishu account unresolved: no valid appId/appSecret found");
+  })
     .then((credentials) => {
       const info = {
         ok: true,
@@ -2004,4 +2037,57 @@ export async function sendAuthCard({
     },
   };
   return sendInteractiveCard(target.receiveId, target.receiveIdType, card, 20000, { accountId });
+}
+
+// ---- auto-sync lark-cli profiles from openclaw.json feishu accounts ----
+export function syncLarkCliProfiles(apiConfig) {
+  const larkCliDir = join(homedir(), ".lark-cli", "openclaw");
+  const larkCliConfig = join(larkCliDir, "config.json");
+  const feishuCfg = apiConfig?.channels?.feishu;
+  if (!feishuCfg) return;
+  const desired = new Map();
+  if (feishuCfg.appId && feishuCfg.appSecret) {
+    desired.set(String(feishuCfg.appId), String(feishuCfg.appSecret));
+  }
+  const accounts = feishuCfg.accounts || {};
+  for (const acc of Object.values(accounts)) {
+    const merged = { ...feishuCfg, ...acc };
+    if (merged.appId && merged.appSecret) {
+      desired.set(String(merged.appId), String(merged.appSecret));
+    }
+  }
+  if (desired.size === 0) return;
+  let config;
+  try {
+    config = JSON.parse(readFileSync(larkCliConfig, "utf-8"));
+  } catch {
+    config = { apps: [] };
+  }
+  if (!Array.isArray(config.apps)) config.apps = [];
+  const existing = new Set(config.apps.map((a) => a.appId));
+  let added = 0;
+  for (const [appId, appSecret] of desired) {
+    if (existing.has(appId)) continue;
+    config.apps.push({
+      appId,
+      appSecret,
+      brand: "feishu",
+      defaultAs: "user",
+      strictMode: "off",
+      users: null,
+    });
+    added++;
+    fileLog(`syncLarkCliProfiles: added profile appId=${appId}`);
+  }
+  if (added > 0) {
+    try {
+      mkdirSync(larkCliDir, { recursive: true });
+      writeFileSync(larkCliConfig, `${JSON.stringify(config, null, 2)}\n`);
+      fileLog(`syncLarkCliProfiles: wrote ${added} new profile(s)`);
+    } catch (e) {
+      fileLog(`syncLarkCliProfiles: write failed: ${e?.message || e}`);
+    }
+  } else {
+    fileLog("syncLarkCliProfiles: all profiles already present");
+  }
 }

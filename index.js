@@ -39,6 +39,7 @@ import {
   startLogin,
   startWaitForAuth,
   cacheAccountIdFromEventAndCtx,
+  syncLarkCliProfiles,
 } from "./utils.js";
 
 const baseDeps = {
@@ -252,6 +253,11 @@ export function createPluginEntry(overrides = {}) {
     resetRuntimeCaches();
     if (cfg.enabled === false) { fileLog("disabled by config"); return; }
     const blockRead = cfg.blockRead !== false;
+    try {
+      syncLarkCliProfiles(apiConfigRef);
+    } catch (e) {
+      fileLog(`syncLarkCliProfiles error: ${e?.message || e}`);
+    }
     ensureFeishuRuntimeHealth().then((info) => {
       if (!info.ok) {
         api.log?.warn?.(`[openclaw-skill-runtime] feishu runtime unavailable: ${info.error || "unknown error"}. ${info.recoveryHint || ""}`.trim());
@@ -775,7 +781,7 @@ export function createPluginEntry(overrides = {}) {
           : null;
         const authTargetKey = getSkillAuthCacheKey(skillPath, ctx);
 
-        const runtime = await ensureFeishuRuntimeHealth();
+        const runtime = await ensureFeishuRuntimeHealth(ctx);
         if (!runtime.ok) {
           const reason = `技能「${skillName}」依赖的飞书运行时当前不可用，无法完成权限校验。${runtime.recoveryHint || "请补齐 Feishu 应用凭据后重试。"}`;
           fileLog(`runtime blocked skill="${skillName}" reason=${reason}`);
