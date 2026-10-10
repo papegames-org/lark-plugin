@@ -37,7 +37,8 @@ import {
   setApiConfigRef,
   setPluginApiRef,
   startLogin,
-  startWaitForAuth
+  startWaitForAuth,
+  cacheAccountIdFromEventAndCtx,
 } from "./utils.js";
 
 const baseDeps = {
@@ -153,6 +154,7 @@ export function createPluginEntry(overrides = {}) {
       ctxChannel: ctx?.channel || null,
       ctxChannelId: ctx?.channelId || null,
       ctxAccountId: ctx?.accountId || ctx?.account || null,
+      eventAccountId: event?.accountId || event?.account || null,
       ctxSessionId: ctx?.sessionId || null,
       ctxSessionKey: ctx?.sessionKey || null,
       ctxTraceKeys: ctx?.trace ? Object.keys(ctx.trace) : null,
@@ -604,6 +606,7 @@ export function createPluginEntry(overrides = {}) {
     }
 
     api.on("before_prompt_build", async (event, ctx) => {
+      cacheAccountIdFromEventAndCtx(event, ctx);
       if (ctx?.workspaceDir && ctx?.sessionId) {
         cachedWorkspaceBySession.set(ctx.sessionId, ctx.workspaceDir);
       }
@@ -652,7 +655,7 @@ export function createPluginEntry(overrides = {}) {
     });
 
     api.on("message_received", async (event, ctx) => {
-      const acc = event?.accountId || ctx?.accountId || ctx?.account || null;
+      const acc = cacheAccountIdFromEventAndCtx(event, ctx) || event?.accountId || ctx?.accountId || ctx?.account || null;
       const sid = ctx?.sessionId || event?.sessionId || null;
       const skey = ctx?.sessionKey || event?.sessionKey || null;
       const senderId = event?.senderId || ctx?.senderId || event?.sender?.id || event?.senderOpenId || ctx?.senderOpenId || null;
@@ -675,6 +678,7 @@ export function createPluginEntry(overrides = {}) {
         fileLog(`hook: tool=${event?.toolName || ""} channel=${ctx?.channel || ""} path=${event?.params?.path || ""}`);
         fileLog(`before_tool_call summary=${safeJson(buildHookDebugSummary(event, ctx))}`);
         if (ctx && ctx.channel && ctx.channel !== "feishu") return;
+        cacheAccountIdFromEventAndCtx(event, ctx);
         const rawPath = event.params?.path;
         const wsDir = resolveWorkspaceDir(ctx);
         const directTarget = resolveSkillReadTarget(rawPath, ctx?.cwd, wsDir);

@@ -150,6 +150,13 @@ export function resolveSkillReadTarget(rawPath, cwd, wsDir) {
   };
 }
 
+function extractEmbeddedOpenId(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return null;
+  const match = normalized.match(/(?:^|:)(ou_[A-Za-z0-9]+)(?::|$)/);
+  return match ? match[1] : null;
+}
+
 export function inferSenderIdFromCtx(ctx) {
   const candidates = [
     ctx?.senderId,
@@ -159,10 +166,13 @@ export function inferSenderIdFromCtx(ctx) {
     ctx?.sender?.senderId?.openId,
     ctx?.sender?.open_id,
     ctx?.channelId,
+    ctx?.sessionKey,
   ];
   for (const value of candidates) {
     const target = normalizeAuthCardTarget(value);
     if (target?.receiveIdType === "open_id") return target.receiveId;
+    const embedded = extractEmbeddedOpenId(value);
+    if (embedded) return embedded;
   }
   return null;
 }
@@ -748,6 +758,36 @@ function normalizeAccountId(value) {
   return trimmed;
 }
 
+export function lookupAccountIdByAgentBinding(ctx) {
+  const cfg = apiConfigRef;
+  const agentId = typeof ctx?.agentId === "string" ? ctx.agentId.trim() : "";
+  if (!agentId || !cfg || !Array.isArray(cfg.bindings)) return null;
+  const hit = cfg.bindings.find(
+    (entry) =>
+      entry?.agentId === agentId &&
+      entry?.match?.channel === "feishu" &&
+      typeof entry?.match?.accountId === "string" &&
+      entry.match.accountId.trim(),
+  );
+  return hit ? normalizeAccountId(hit.match.accountId) : null;
+}
+
+export function cacheAccountIdFromEventAndCtx(event, ctx) {
+  const acc =
+    normalizeAccountId(event?.accountId) ||
+    normalizeAccountId(event?.account) ||
+    normalizeAccountId(ctx?.accountId) ||
+    normalizeAccountId(ctx?.account) ||
+    normalizeAccountId(ctx?.channelAccountId) ||
+    null;
+  if (!acc) return null;
+  const sid = ctx?.sessionId || event?.sessionId || null;
+  const skey = ctx?.sessionKey || event?.sessionKey || null;
+  if (sid) cachedAccountBySession.set(sid, acc);
+  if (skey) cachedAccountBySession.set(skey, acc);
+  return acc;
+}
+
 export function getAccountId(ctx) {
   const direct =
     normalizeAccountId(ctx?.accountId) ||
@@ -761,8 +801,17 @@ export function getAccountId(ctx) {
   if (ctx?.sessionKey && cachedAccountBySession.has(ctx.sessionKey)) {
     return normalizeAccountId(cachedAccountBySession.get(ctx.sessionKey));
   }
+  const fromBinding = lookupAccountIdByAgentBinding(ctx);
+  if (fromBinding) {
+    fileLog(
+      `getAccountId: from bindings agentId=${ctx?.agentId || "<none>"} -> ${fromBinding}`,
+    );
+    if (ctx?.sessionId) cachedAccountBySession.set(ctx.sessionId, fromBinding);
+    if (ctx?.sessionKey) cachedAccountBySession.set(ctx.sessionKey, fromBinding);
+    return fromBinding;
+  }
   fileLog(
-    `getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} cacheSize=${cachedAccountBySession.size}`,
+    `getAccountId: MISS sessionId=${ctx?.sessionId || "<none>"} sessionKey=${ctx?.sessionKey || "<none>"} agentId=${ctx?.agentId || "<none>"} cacheSize=${cachedAccountBySession.size}`,
   );
   return null;
 }
@@ -850,6 +899,10 @@ export async function getAccountCredentials(ctx) {
   } else if (!requestedAccountId && accountIds.length === 1) {
     resolvedAccountId = accountIds[0];
     merged = { ...feishuCfg, ...accounts[resolvedAccountId] };
+  } else if (!requestedAccountId && accountIds.length > 1) {
+    throw new Error(
+      `feishu account unresolved: ctx.accountId missing with multiple feishu accounts [${accountIds.join(", ")}]; Gateway must pass accountId on inbound messages, or add bindings[].match.accountId for agentId=${ctx?.agentId || "unknown"}`,
+    );
   } else if (!requestedAccountId && feishuCfg.appId && feishuCfg.appSecret) {
     resolvedAccountId = "default";
   } else if (
