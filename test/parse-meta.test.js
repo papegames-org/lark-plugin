@@ -14,6 +14,7 @@ metadata: { "openclaw": { "larkAuth": { "identity": "user", "scopes": ["im:messa
   assert.deepEqual(readLarkAuthFromContent(content), {
     identity: "user",
     scopes: ["im:message", "contact:user.base:readonly"],
+    scopeInstallGrant: {},
   });
 });
 
@@ -35,6 +36,7 @@ metadata:
   assert.deepEqual(readLarkAuthFromContent(content), {
     identity: "user",
     scopes: ["im:message", "contact:user.base:readonly"],
+    scopeInstallGrant: {},
   });
 });
 

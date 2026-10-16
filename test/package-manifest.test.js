@@ -8,7 +8,7 @@ test("package manifest omits legacy CLI helpers and extra runtime dependencies",
 
   assert.ok(!files.includes("openclaw-runtime.js"));
   assert.ok(!("bundledDependencies" in pkg));
-  assert.equal(pkg.scripts?.test, "node --test");
+  assert.equal(pkg.scripts?.test, "node --test --test-force-exit \"test/**/*.test.js\"");
   assert.equal(pkg.scripts?.["check:version"], "node ./scripts/check-version.js");
   assert.match(pkg.scripts?.["release:check"] || "", /check:version/u);
   assert.ok(!("dependencies" in pkg));
