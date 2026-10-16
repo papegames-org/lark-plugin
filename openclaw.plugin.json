@@ -1,7 +1,7 @@
 {
   "id": "openclaw-skill-runtime",
   "name": "openclaw-skill-runtime",
-  "version": "0.11.0",
+  "version": "1.0.1",
   "description": "读 SKILL.md 时识别 skill 并预授权其声明的飞书 scope（metadata.openclaw.larkAuth）",
   "main": "index.js",
   "activation": {
@@ -24,6 +24,10 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Override default skill root dirs to scan."
+      },
+      "defaultFeishuAccountId": {
+        "type": "string",
+        "description": "Fallback Feishu account ID to use when hook ctx has no account info and multiple accounts are configured. Admin must set this explicitly; plugin will never auto-guess."
       }
     }
   }

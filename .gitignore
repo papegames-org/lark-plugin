@@ -1,0 +1,5 @@
+# Local skill samples / zip extracts — keep skills outside this plugin repo
+.tmp-*/
+
+# Pack artifacts (publish from CI or local npm pack)
+*.tgz

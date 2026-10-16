@@ -66,6 +66,8 @@ larkAuth:
 ---
 ```
 
+混合 `--as user` / `--as bot` 的 Skill 应额外声明 **`appScopes`**（应用/bot 安装桶）与 **`userScopes`**（用户 OAuth 与用户安装桶），与 `scopes` 全量列表一致。插件按声明分桶检查，不再根据 scope 名称前缀猜测。
+
 只有当：
 
 - `identity` 为 `user`
@@ -115,6 +117,17 @@ const blockRead = cfg.blockRead !== false;
 - 飞书 channel 上下文
 - `api.config.channels.feishu.accounts`
 - 当前飞书账号对应的 `appId` / `appSecret`
+
+### 多 agent / 多飞书账号
+
+每个 agent 应使用自己的飞书 bot。推荐配置：
+
+1. **Gateway（推荐）**：飞书链路上的 hook ctx 带上 `agentId`、`accountId`、`sessionKey`。
+2. **bindings**：每个 agent 一条 `{ agentId, match: { channel: "feishu", accountId: "<id>" } }`（main 通常指向 `default`）。
+3. **accounts**：`accounts.default` 写完整 `appId/appSecret`（可与根级相同）；子 agent 常用 `agentId === accounts` key 的约定。
+4. **defaultFeishuAccountId**（可选）：显式指定 hook 无 `accountId` 时的兜底账号。未配置时，若存在 `accounts.default` 且当前 agent 为 `main` 或未知，插件会 **隐式使用 `default`**；非 main 的子 agent 仍须 bindings 或入站 `accountId`。
+
+插件还会在 hook 之间缓存 agent/account，并支持 `workspaceDir` 反查 `agents.list` 以补全缺失的 `agentId`。详见 [docs/openclaw-gateway-notes.md](./docs/openclaw-gateway-notes.md)。
 
 插件会直接通过飞书开放平台 HTTP 接口完成：
 
@@ -257,6 +270,8 @@ openclaw logs --follow
 - 用户需要授权时，插件调用 `lark-cli auth login --scope ... --no-wait --json` 生成卡片链接，再由后台 `lark-cli auth login --device-code ...` 完成轮询、兑换和 token 持久化；插件不另存 OAuth token。
 - 明确识别到用户令牌失效、撤权或缺少 scope 时，会发送重新授权/补充授权卡片；配置、网络、profile 或身份无法可靠判定时则保守阻断。
 - 卡片会展示当前缺失的 scope；但用户补充授权及后续确认始终使用该 Skill 在 `larkAuth.scopes` 中声明的完整 scope 集合。
+- 授权轮询失败时，授权卡片会展示**可读失败原因**与**建议操作**；同时在 Gateway 本机写入诊断 log（默认目录：`$OPENCLAW_DATA_DIR/plugins/openclaw-skill-runtime/diagnostics/`，未设置时一般为 `~/.openclaw-data/plugins/openclaw-skill-runtime/diagnostics/`）。卡片上会给出完整文件路径；并**额外发送一条飞书文本消息**（含 build、原因、日志路径）。**橙色授权卡 footer** 应显示 `runtime 1.0.1+authDiagnostics.x` — 若无该行，说明 Gateway 未加载本仓库安装的新插件。
+- 安装到 OpenClaw 请使用：`npx @jianguo_paper/openclaw-skill-runtime@latest install-openclaw` 或 `openclaw plugins install ./jianguo_paper-openclaw-skill-runtime-1.0.1.tgz`，然后**重启 Gateway**。仅在开发目录 `npm install` 本地 tgz **不会**自动替换 OpenClaw 已加载的插件副本。
 
 ## 版本管理与 npm 发布
 
