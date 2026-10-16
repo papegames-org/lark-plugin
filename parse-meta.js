@@ -132,29 +132,36 @@ function parseYamlLarkAuthBlock(block) {
     isDirectContent = true;
   }
 
-  const result = { identity: undefined, scopes: [] };
-  let inScopes = false;
+  const result = { identity: undefined, scopes: [], appScopes: [], userScopes: [] };
+  let listTarget = null;
   for (let i = startLine; i < lines.length; i++) {
     const line = lines[i];
     if (line.trim() === "") continue;
     const indent = line.match(/^(\s*)/)[1].length;
     if (!isDirectContent && indent <= indentLevel) break;
     const t = line.trim();
-    if (inScopes && t.startsWith("- ")) {
-      result.scopes.push(stripQuotes(t.slice(2).trim()));
+    if (listTarget && t.startsWith("- ")) {
+      result[listTarget].push(stripQuotes(t.slice(2).trim()));
       continue;
     }
-    inScopes = false;
+    listTarget = null;
     const idM = t.match(/^identity:\s*(.+)$/);
     if (idM) { result.identity = stripQuotes(idM[1].trim()); continue; }
-    if (/^scopes:\s*$/.test(t)) { inScopes = true; continue; }
-    const inlineArr = t.match(/^scopes:\s*(\[.*\])\s*$/);
+    if (/^scopes:\s*$/.test(t)) { listTarget = "scopes"; continue; }
+    if (/^appScopes:\s*$/.test(t)) { listTarget = "appScopes"; continue; }
+    if (/^userScopes:\s*$/.test(t)) { listTarget = "userScopes"; continue; }
+    const inlineArr = t.match(/^(scopes|appScopes|userScopes):\s*(\[.*\])\s*$/);
     if (inlineArr) {
-      try { const arr = JSON.parse(inlineArr[1]); if (Array.isArray(arr)) result.scopes.push(...arr.map(String)); } catch {}
+      try {
+        const arr = JSON.parse(inlineArr[2]);
+        if (Array.isArray(arr)) result[inlineArr[1]].push(...arr.map(String));
+      } catch {}
       continue;
     }
   }
-  if (result.identity === undefined && result.scopes.length === 0) return null;
+  if (result.identity === undefined && result.scopes.length === 0 && result.appScopes.length === 0 && result.userScopes.length === 0) {
+    return null;
+  }
   return normalize(result);
 }
 
@@ -166,15 +173,56 @@ function stripQuotes(s) {
   return s;
 }
 
+function normalizeScopeGrant(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (["app", "application", "tenant", "bot", "application_identity"].includes(raw)) return "app";
+  if (["user", "user_identity", "user_access_token"].includes(raw)) return "user";
+  return null;
+}
+
+function collectScopeGrantEntries(target, scopeGrantByScope) {
+  if (!Array.isArray(target)) return;
+  for (const item of target) {
+    if (typeof item === "string" || !item || typeof item !== "object") continue;
+    const scope = String(item.scope || item.name || item.id || "").trim();
+    if (!scope) continue;
+    const grant = normalizeScopeGrant(item.grant || item.as || item.identity);
+    if (grant) scopeGrantByScope.set(scope, grant);
+  }
+}
+
 function normalize(la) {
   if (!la || typeof la !== "object") return null;
-  const scopes = Array.isArray(la.scopes)
-    ? [...new Set(la.scopes.map((s) => String(s).trim()).filter(Boolean))]
-    : [];
+  const scopeGrantByScope = new Map();
+  collectScopeGrantEntries(la.scopes, scopeGrantByScope);
+  for (const scope of Array.isArray(la.appScopes) ? la.appScopes : []) {
+    const normalized = String(scope || "").trim();
+    if (normalized) scopeGrantByScope.set(normalized, "app");
+  }
+  for (const scope of Array.isArray(la.userScopes) ? la.userScopes : []) {
+    const normalized = String(scope || "").trim();
+    if (normalized) scopeGrantByScope.set(normalized, "user");
+  }
+
+  const scopeSet = new Set();
+  for (const scope of scopeGrantByScope.keys()) scopeSet.add(scope);
+  for (const scope of Array.isArray(la.scopes) ? la.scopes : []) {
+    if (typeof scope === "string" && scope.trim()) scopeSet.add(scope.trim());
+  }
+
+  const scopes = [...scopeSet];
   if (scopes.length === 0) return null;
+
+  const scopeInstallGrant = {};
+  for (const [scope, grant] of scopeGrantByScope.entries()) {
+    if (grant === "app" || grant === "user") scopeInstallGrant[scope] = grant;
+  }
+
   return {
     identity: la.identity || "user",
     scopes,
+    scopeInstallGrant,
   };
 }
 
@@ -182,7 +230,7 @@ function normalize(la) {
 /**
  * 读取 SKILL.md 内容，提取 larkAuth 权限声明。
  * @param {string} content - SKILL.md 文件内容
- * @returns {{ identity: string, scopes: string[] } | null}
+ * @returns {{ identity: string, scopes: string[], scopeInstallGrant?: Record<string, "app"|"user"> } | null}
  */
 export function readLarkAuthFromContent(content) {
   const block = extractFrontmatter(content);
