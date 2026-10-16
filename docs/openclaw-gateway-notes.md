@@ -100,7 +100,28 @@ The plugin should evolve in this direction:
 - minimal volatile state; anything non-essential should be rebuilt after restart
 - no hidden dependency on global shell state
 
-## 9. Recommended operator checklist
+## 9. Feishu hook ctx should carry routing identity
+
+For multi-agent / multi-account Feishu installs, Gateway should pass the same routing
+fields on `message_received`, `before_prompt_build`, and `before_tool_call`:
+
+- `agentId`
+- `accountId` (or `account`)
+- `sessionKey` / `sessionId`
+- `senderId` when available
+
+`openclaw-skill-runtime` can backfill missing values using:
+
+- `bindings[].match.accountId` per `agentId`
+- convention `agentId === accounts.<id>` (common for dedicated sub-agents)
+- convention `main` → `default` when root / `accounts.default` credentials exist
+- session caches populated by earlier hooks in the same conversation
+- `workspaceDir` → `agents.list[].workspace` reverse lookup
+
+Gateway injection remains the authoritative fix; plugin fallbacks reduce breakage when
+tool hooks arrive with sparse ctx.
+
+## 10. Recommended operator checklist
 
 When debugging a production installation:
 
