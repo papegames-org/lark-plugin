@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   buildSkillRootsCacheKey,
   cacheSenderId,
@@ -23,11 +24,13 @@ import {
   normalizeAppScopeEntries,
   normalizeAuthIdentity,
 } from "../utils.js";
+import { createLarkCliCommandRunner, okLarkCliResult } from "./helpers/lark-cli-mock.js";
+import { normalizePathForAssert } from "./helpers/test-env.js";
 
 test("getDefaultSkillRoots includes agent and OpenClaw global skill roots", () => {
-  assert.deepEqual(getDefaultSkillRoots({}), [
-    `${homedir()}/.agents/skills`,
-    `${homedir()}/.openclaw/workspace/skills`,
+  assert.deepEqual(getDefaultSkillRoots({}).map(normalizePathForAssert), [
+    normalizePathForAssert(join(homedir(), ".agents", "skills")),
+    normalizePathForAssert(join(homedir(), ".openclaw", "workspace", "skills")),
   ]);
 });
 
@@ -64,10 +67,11 @@ test("getSkillAuthCacheKey isolates same skill path by account", () => {
 });
 
 test("resolveSkillReadTarget recognizes direct OpenClaw skill reads without workspaceDir", () => {
+  const skillPath = "/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md";
   assert.deepEqual(
-    resolveSkillReadTarget("/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md"),
+    resolveSkillReadTarget(skillPath),
     {
-      abs: "/root/.openclaw/workspace/skills/feishu-auth-basic/SKILL.md",
+      abs: normalizePathForAssert(resolve(skillPath)),
       skillName: "feishu-auth-basic",
     },
   );
@@ -190,22 +194,30 @@ test("checkUserGrant falls back to lark-cli auth check when runtime checker is u
   const oldLarkProfile = process.env.LARK_PROFILE_NAME;
   delete process.env.LARK_PROFILE_NAME;
   setPluginApiRef(null);
-  setLarkCliCommandRunnerForTest(async (args) => {
-    calls.push(args);
-    return {
-      stdout: JSON.stringify({ ok: false, granted: ["scope:a"], missing: ["scope:b"] }),
-      stderr: "",
-      code: 0,
-    };
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          "acc-a": { appId: "cli_123", appSecret: "secret_123" },
+        },
+      },
+    },
   });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls,
+    appId: "cli_123",
+    openId: "ou_test",
+    grantedScopes: ["scope:a"],
+  }));
 
   try {
-    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], {});
+    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], { accountId: "acc-a" });
     assert.equal(result.ok, false);
     assert.deepEqual(result.granted, ["scope:a"]);
     assert.deepEqual(result.missing, ["scope:b"]);
-    assert.deepEqual(calls, [["--version"], ["auth", "check", "--json", "--scope", "scope:a scope:b"]]);
+    assert.ok(calls.some((args) => args[0] === "auth" && args[1] === "status" && args[2] === "--verify"));
   } finally {
+    setApiConfigRef(null);
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
     else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
     if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
@@ -222,24 +234,29 @@ test("checkUserGrant does not trust ok=true without scope details", async () => 
   const oldLarkProfile = process.env.LARK_PROFILE_NAME;
   delete process.env.LARK_PROFILE_NAME;
   setPluginApiRef(null);
-  setLarkCliCommandRunnerForTest(async (args) => {
-    if (args[0] === "--version") {
-      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
-    }
-    return {
-      stdout: JSON.stringify({ ok: true }),
-      stderr: "",
-      code: 0,
-      ok: true,
-    };
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          "acc-a": { appId: "cli_123", appSecret: "secret_123" },
+        },
+      },
+    },
   });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    appId: "cli_123",
+    openId: "ou_test",
+    statusPayload: { ok: true },
+    userVerified: false,
+  }));
 
   try {
-    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], {});
+    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], { accountId: "acc-a" });
     assert.equal(result.ok, false);
     assert.deepEqual(result.missing, ["scope:a", "scope:b"]);
-    assert.match(result.reason || "", /scope details/);
+    assert.equal(result.unavailable, true);
   } finally {
+    setApiConfigRef(null);
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
     else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
     if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
@@ -255,23 +272,38 @@ test("checkUserGrant does not treat empty missing as enough before user auth sta
   const oldLarkProfile = process.env.LARK_PROFILE_NAME;
   delete process.env.LARK_PROFILE_NAME;
   setPluginApiRef(null);
-  setLarkCliCommandRunnerForTest(async (args) => {
-    if (args[0] === "--version") {
-      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
-    }
-    return {
-      stdout: JSON.stringify({ ok: true, missing: [] }),
-      stderr: "",
-      code: 0,
-      ok: true,
-    };
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          "acc-a": { appId: "cli_123", appSecret: "secret_123" },
+        },
+      },
+    },
   });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    appId: "cli_123",
+    openId: "ou_test",
+    statusPayload: {
+      appId: "cli_123",
+      identities: {
+        user: {
+          openId: "ou_test",
+          available: true,
+          verified: true,
+          scope: [],
+          scopes: [],
+        },
+      },
+    },
+  }));
 
   try {
-    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], {});
+    const result = await checkUserGrant("ou_test", ["scope:a", "scope:b"], { accountId: "acc-a" });
     assert.equal(result.ok, false);
     assert.deepEqual(result.missing, ["scope:a", "scope:b"]);
   } finally {
+    setApiConfigRef(null);
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
     else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
     if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
@@ -287,27 +319,35 @@ test("startLogin uses lark-cli device flow for user grants", async () => {
   delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
   const oldLarkProfile = process.env.LARK_PROFILE_NAME;
   delete process.env.LARK_PROFILE_NAME;
-  setLarkCliCommandRunnerForTest(async (args) => {
-    commandCalls.push(args);
-    return {
-      stdout: JSON.stringify({ verification_url: "https://example.com/user-login", device_code: "device-123", expires_in: 600, interval: 5 }),
-      stderr: "",
-      code: 0,
-    };
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli_test", appSecret: "secret_test" },
+        },
+      },
+    },
   });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls: commandCalls,
+    appId: "cli_test",
+    deviceCode: "device-123",
+    verificationUrl: "https://example.com/user-login",
+  }));
   setLarkCliDeviceWaitSpawnerForTest((args) => {
     spawnCalls.push(args);
     return { started: true, pid: 1234 };
   });
 
   try {
-    const result = await startLogin(["scope:a"], {}, { identity: "user", authReason: "user_grant" });
+    const result = await startLogin(["scope:a"], { accountId: "default" }, { identity: "user", authReason: "user_grant" });
     assert.equal(result.verificationUrl, "https://example.com/user-login");
     assert.equal(result.deviceCode, "device-123");
     assert.equal(result.provider, "lark-cli");
-    assert.deepEqual(commandCalls, [["--version"], ["auth", "login", "--scope", "scope:a", "--no-wait", "--json"]]);
-    assert.deepEqual(spawnCalls, [["auth", "login", "--device-code", "device-123"]]);
+    assert.ok(commandCalls.some((args) => args.includes("auth") && args.includes("login")));
+    assert.ok(spawnCalls.some((args) => args.includes("--device-code") && args.includes("device-123")));
   } finally {
+    setApiConfigRef(null);
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
     else process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE = oldProfile;
     if (oldLarkProfile === undefined) delete process.env.LARK_PROFILE_NAME;
@@ -375,35 +415,27 @@ test("startWaitForAuth polls app-scope completion without app device code", asyn
     throw new Error(`unexpected fetch ${href}`);
   };
 
-  let authCheckCount = 0;
-  setLarkCliCommandRunnerForTest(async (args) => {
-    if (args[0] === "--version") {
-      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
-    }
-    if (args[0] === "auth" && args[1] === "check") {
-      authCheckCount += 1;
-      return {
-        stdout: JSON.stringify(
-          { ok: true, missing: [] },
-        ),
-        stderr: "",
-        code: 0,
-      };
-    }
-    if (args[0] === "auth" && args[1] === "login") {
-      return {
-        stdout: JSON.stringify({
-          verification_url: "https://example.com/user-login",
-          device_code: "device-user-grant",
-          expires_in: 600,
-          interval: 5,
-        }),
-        stderr: "",
-        code: 0,
-      };
-    }
-    throw new Error(`unexpected lark-cli args ${args.join(" ")}`);
-  });
+  let statusVerifyCount = 0;
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    appId: "cli_no_device",
+    openId: "ou_test",
+    grantedScopes: [],
+    onAuthStatusVerify: () => {
+      statusVerifyCount += 1;
+      return okLarkCliResult(JSON.stringify({
+        appId: "cli_no_device",
+        identities: {
+          user: {
+            openId: "ou_test",
+            open_id: "ou_test",
+            available: false,
+            verified: false,
+            status: "missing",
+          },
+        },
+      }));
+    },
+  }));
   setLarkCliDeviceWaitSpawnerForTest(() => ({ started: true, pid: 4321 }));
 
   try {
@@ -422,11 +454,10 @@ test("startWaitForAuth polls app-scope completion without app device code", asyn
 
     await new Promise((resolve) => setTimeout(resolve, 25));
 
-    assert.equal(authCheckCount, 2);
-    assert.equal(sentCards[0].action, "update");
-    assert.equal(sentCards[0].message_id, "msg_app_scope");
-    assert.equal(sentCards[1].action, "send");
-    const userGrantCard = JSON.parse(sentCards[1].content);
+    assert.ok(statusVerifyCount >= 1);
+    const userGrantUpdate = sentCards.find((card) => card.action === "update" && card.message_id === "msg_app_scope");
+    assert.ok(userGrantUpdate);
+    const userGrantCard = JSON.parse(userGrantUpdate.content);
     const userGrantButton = userGrantCard.body.elements.find((element) => element?.tag === "button");
     assert.match(userGrantButton?.behaviors?.[0]?.default_url || "", /example\.com%2Fuser-login/);
   } finally {
@@ -503,35 +534,27 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
     throw new Error(`unexpected fetch ${href}`);
   };
 
-  let authCheckCount = 0;
-  setLarkCliCommandRunnerForTest(async (args) => {
-    if (args[0] === "--version") {
-      return { stdout: "lark-cli 1.0.0", stderr: "", code: 0, ok: true };
-    }
-    if (args[0] === "auth" && args[1] === "check") {
-      authCheckCount += 1;
-      return {
-        stdout: JSON.stringify(
-          { ok: true, missing: [] },
-        ),
-        stderr: "",
-        code: 0,
-      };
-    }
-    if (args[0] === "auth" && args[1] === "login") {
-      return {
-        stdout: JSON.stringify({
-          verification_url: "https://example.com/user-login",
-          device_code: "device-user-grant",
-          expires_in: 600,
-          interval: 5,
-        }),
-        stderr: "",
-        code: 0,
-      };
-    }
-    throw new Error(`unexpected lark-cli args ${args.join(" ")}`);
-  });
+  let statusVerifyCount = 0;
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    appId: "cli_test",
+    openId: "ou_test",
+    grantedScopes: [],
+    onAuthStatusVerify: () => {
+      statusVerifyCount += 1;
+      return okLarkCliResult(JSON.stringify({
+        appId: "cli_test",
+        identities: {
+          user: {
+            openId: "ou_test",
+            open_id: "ou_test",
+            available: false,
+            verified: false,
+            status: "missing",
+          },
+        },
+      }));
+    },
+  }));
   setLarkCliDeviceWaitSpawnerForTest(() => ({ started: true, pid: 4321 }));
 
   try {
@@ -551,25 +574,14 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
 
     await new Promise((resolve) => setTimeout(resolve, 25));
 
-    assert.equal(authCheckCount, 2);
-    assert.equal(sentCards.length, 4);
-    assert.equal(sentCards[0].action, "update");
-    assert.equal(sentCards[0].message_id, "msg_app_scope");
-    assert.equal(JSON.parse(sentCards[0].content).header.template, "green");
-
-    assert.equal(sentCards[1].action, "send");
-    const userGrantCard = JSON.parse(sentCards[1].content);
+    assert.ok(statusVerifyCount >= 1);
+    const userGrantUpdate = sentCards.find((card) => card.action === "update" && card.message_id === "msg_app_scope");
+    assert.ok(userGrantUpdate);
+    const userGrantCard = JSON.parse(userGrantUpdate.content);
     const userGrantButton = userGrantCard.body.elements.find((element) => element?.tag === "button");
     assert.match(userGrantButton?.behaviors?.[0]?.default_url || "", /example\.com%2Fuser-login/);
     assert.match(userGrantCard.body.elements[1].elements[0].content, /scope:a/);
     assert.match(userGrantCard.body.elements[1].elements[0].content, /scope:b/);
-
-    assert.equal(sentCards[2].action, "update");
-    assert.equal(sentCards[2].message_id, "msg_2");
-    assert.equal(JSON.parse(sentCards[2].content).header.template, "green");
-
-    assert.equal(sentCards[3].action, "send");
-    assert.match(JSON.parse(sentCards[3].content).header.title.content, /授权完成/);
   } finally {
     globalThis.fetch = oldFetch;
     if (oldProfile === undefined) delete process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;

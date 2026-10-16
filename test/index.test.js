@@ -3,11 +3,15 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { createPluginEntry } from "../index.js";
-import { resolveSkillReadTarget } from "../utils.js";
+import { resetRuntimeCaches, resolveSkillReadTarget } from "../utils.js";
+import { assertAuthCardRecipient } from "./helpers/auth-card-assert.js";
+import { isolateOpenClawDataDir } from "./helpers/test-env.js";
 
 const basicSkillPath = fileURLToPath(new URL("./fixtures/skills/feishu-auth-basic/SKILL.md", import.meta.url));
 
 test("before_tool_call sends auth card for direct OpenClaw test skill reads", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const senderBySession = new Map();
   const captured = {
@@ -32,7 +36,7 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
     fileLog() {},
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() {
       return "/tmp/openclaw-skill-runtime-index-test.json";
     },
@@ -69,10 +73,13 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
       userCode: "USERCODE",
       deviceCode: "DEVICECODE",
     }),
-    getAuthedUser: async (ctx) => {
-      const openId = getCachedSenderId(ctx);
-      return openId ? { openId } : null;
-    },
+    checkUserGrant: async () => ({
+      ok: false,
+      missing: ["contact:user.base:readonly"],
+      granted: [],
+      reason: "mock user grant unavailable",
+    }),
+    getAuthedUser: async () => ({ openId: "ou_test_123" }),
     sendAuthCard: async (payload) => {
       captured.sendAuthCard.push(payload);
       return { messageId: "msg_123" };
@@ -136,19 +143,19 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
     },
   );
 
-  assert.deepEqual(captured.sendAuthCard, [
-    {
-      skillName: "feishu-auth-basic",
-      missing: ["contact:user.base:readonly"],
-      verificationUrl: "https://example.com/auth",
-      userCode: "USERCODE",
-      deviceCode: "DEVICECODE",
-      openId: "ou_test_123",
-      accountId: "acc-a",
-      identity: "user",
-      authReason: "app_scope",
-    },
-  ]);
+  assert.equal(captured.sendAuthCard.length, 1);
+  const card = captured.sendAuthCard[0];
+  assert.equal(card.skillName, "feishu-auth-basic");
+  assert.deepEqual(card.missing, ["contact:user.base:readonly"]);
+  assert.equal(card.verificationUrl, "https://example.com/auth");
+  assert.equal(card.userCode, "USERCODE");
+  assert.equal(card.deviceCode, "DEVICECODE");
+  assertAuthCardRecipient(card, "ou_test_123");
+  assert.equal(card.accountId, "acc-a");
+  assert.equal(card.identity, "user");
+  assert.equal(card.authReason, "app_scope");
+  assert.equal(card.userScopeCount, 5);
+  assert.equal(card.userGrantAlreadyComplete, false);
   assert.equal(captured.startWaitForAuth.length, 1);
   assert.equal(captured.startWaitForAuth[0].skillName, "feishu-auth-basic");
   assert.equal(captured.startWaitForAuth[0].openId, "ou_test_123");
@@ -156,9 +163,14 @@ test("before_tool_call sends auth card for direct OpenClaw test skill reads", as
   assert.equal(captured.startWaitForAuth[0].authReason, "app_scope");
   assert.equal(result?.block, true);
   assert.match(result?.reason || "", /已发送授权卡片/);
+  } finally {
+    env.restore();
+  }
 });
 
 test("before_tool_call can resolve the test skill from ctx.skillCommand when read path is unavailable", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = {
     sendAuthCard: [],
@@ -169,7 +181,7 @@ test("before_tool_call can resolve the test skill from ctx.skillCommand when rea
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() {
       return "/tmp/openclaw-skill-runtime-index-test-skill-command.json";
     },
@@ -258,11 +270,16 @@ test("before_tool_call can resolve the test skill from ctx.skillCommand when rea
 
   assert.equal(captured.sendAuthCard.length, 1);
   assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-basic");
-  assert.equal(captured.sendAuthCard[0].openId, "ou_skill_command_123");
+  assertAuthCardRecipient(captured.sendAuthCard[0], "ou_skill_command_123");
   assert.equal(result?.block, true);
+  } finally {
+    env.restore();
+  }
 });
 
 test("before_tool_call can infer the Feishu recipient from channelId for direct skill reads", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = {
     sendAuthCard: [],
@@ -273,7 +290,7 @@ test("before_tool_call can infer the Feishu recipient from channelId for direct 
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() {
       return "/tmp/openclaw-skill-runtime-index-test-channel-id.json";
     },
@@ -362,12 +379,17 @@ test("before_tool_call can infer the Feishu recipient from channelId for direct 
   );
 
   assert.equal(captured.sendAuthCard.length, 1);
-  assert.equal(captured.sendAuthCard[0].openId, "ou_channel_fallback_123");
+  assertAuthCardRecipient(captured.sendAuthCard[0], "ou_channel_fallback_123");
   assert.equal(captured.sendAuthCard[0].accountId, "acc-a");
   assert.equal(result?.block, true);
+  } finally {
+    env.restore();
+  }
 });
 
 test("before_tool_call can authorize skill runtime invocations without a read tool call", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = {
     sendAuthCard: [],
@@ -379,7 +401,7 @@ test("before_tool_call can authorize skill runtime invocations without a read to
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() {
       return "/tmp/openclaw-skill-runtime-index-test-trace-skill-command.json";
     },
@@ -415,6 +437,12 @@ test("before_tool_call can authorize skill runtime invocations without a read to
       verificationUrl: "https://example.com/auth",
       userCode: "USERCODE",
       deviceCode: "DEVICECODE",
+    }),
+    checkUserGrant: async () => ({
+      ok: false,
+      missing: ["contact:user.base:readonly"],
+      granted: [],
+      reason: "mock user grant unavailable",
     }),
     getAuthedUser: async () => ({ openId: "ou_trace_skill_command_123" }),
     sendAuthCard: async (payload) => {
@@ -473,21 +501,27 @@ test("before_tool_call can authorize skill runtime invocations without a read to
 
   assert.equal(captured.sendAuthCard.length, 1);
   assert.equal(captured.sendAuthCard[0].skillName, "feishu-auth-basic");
-  assert.equal(captured.sendAuthCard[0].openId, "ou_trace_skill_command_123");
+  assertAuthCardRecipient(captured.sendAuthCard[0], "ou_trace_skill_command_123");
   assert.equal(captured.sendAuthCard[0].accountId, "acc-a");
   assert.equal(captured.startWaitForAuth.length, 1);
   assert.equal(result?.block, true);
+  } finally {
+    env.restore();
+  }
 });
 
 test("before_tool_call sends user-grant card when app scopes are open but user grant is unverifiable", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
+  let userGrantChecks = 0;
   const plugin = createPluginEntry({
     fileLog() {},
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-user-grant.json"; },
     readPendingAuthNoticeStore() { return new Map(); },
     writePendingAuthNoticeStore() {},
@@ -503,6 +537,10 @@ test("before_tool_call sends user-grant card when app scopes are open but user g
     checkScopes: async (_scopes, _ctx, options) => ({ ok: true, missing: [], granted: _scopes, identity: options.identity }),
     checkUserGrant: async (openId, scopes, _ctx, options) => {
       captured.checkUserGrant.push({ openId, scopes, options });
+      userGrantChecks += 1;
+      if (userGrantChecks >= 2) {
+        return { ok: true, missing: [], granted: scopes, hasScopeDetails: true };
+      }
       return {
         ok: false,
         missing: scopes,
@@ -543,9 +581,14 @@ test("before_tool_call sends user-grant card when app scopes are open but user g
 
   const afterUserGrant = await handlers.get("before_tool_call")({ toolName: "read", params: { path: basicSkillPath } }, { channel: "feishu", accountId: "acc-a", skillCommand: { skillName: "feishu-auth-basic" } });
   assert.equal(afterUserGrant, undefined);
+  } finally {
+    env.restore();
+  }
 });
 
 test("before_tool_call does not resend user-grant card after background app-scope poll sends one", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const scopes = ["aily:data_asset:upload_file", "base:block:create"];
   const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
@@ -555,7 +598,7 @@ test("before_tool_call does not resend user-grant card after background app-scop
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-user-grant-cooldown.json"; },
     readPendingAuthNoticeStore() { return new Map(); },
     writePendingAuthNoticeStore() {},
@@ -613,8 +656,13 @@ test("before_tool_call does not resend user-grant card after background app-scop
   const second = await handlers.get("before_tool_call")(event, ctx);
   assert.equal(second?.block, true);
   assert.equal(captured.sendAuthCard.length, 1);
+  } finally {
+    env.restore();
+  }
 });
 test("before_tool_call allows user identity skill when user grant scopes are verified", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = { sendAuthCard: [], checkUserGrant: [], startWaitForAuth: [] };
   const plugin = createPluginEntry({
@@ -622,7 +670,7 @@ test("before_tool_call allows user identity skill when user grant scopes are ver
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-user-grant-verified.json"; },
     readPendingAuthNoticeStore() { return new Map(); },
     writePendingAuthNoticeStore() {},
@@ -661,8 +709,13 @@ test("before_tool_call allows user identity skill when user grant scopes are ver
   assert.equal(captured.sendAuthCard.length, 0);
   assert.equal(captured.startWaitForAuth.length, 0);
   assert.equal(result, undefined);
+  } finally {
+    env.restore();
+  }
 });
 test("before_tool_call allows app identity skill when app identity scopes are open", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
   const handlers = new Map();
   const captured = { sendAuthCard: [], checkScopes: [] };
   const plugin = createPluginEntry({
@@ -670,7 +723,7 @@ test("before_tool_call allows app identity skill when app identity scopes are op
     logCtxSnapshotOnce() {},
     setApiConfigRef() {},
     setPluginApiRef() {},
-    resetRuntimeCaches() {},
+    resetRuntimeCaches,
     getPendingAuthNoticeStorePath() { return "/tmp/openclaw-skill-runtime-app-identity.json"; },
     readPendingAuthNoticeStore() { return new Map(); },
     writePendingAuthNoticeStore() {},
@@ -707,4 +760,7 @@ test("before_tool_call allows app identity skill when app identity scopes are op
   assert.equal(captured.checkScopes[0].identity, "app");
   assert.equal(captured.sendAuthCard.length, 0);
   assert.equal(result, undefined);
+  } finally {
+    env.restore();
+  }
 });
