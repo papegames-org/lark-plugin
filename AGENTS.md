@@ -88,21 +88,7 @@ const blockRead = cfg.blockRead !== false;
 
 这不是偶然行为，而是“宁可误拦，也不误放”的策略。动这块之前要先确认产品预期。
 
-### 3. 飞书多 agent 路由解析
-
-插件会按以下顺序为当前 hook 解析 `accountId`（见 [utils.js](./utils.js)）：
-
-1. hook ctx / event 上的 `accountId`
-2. 同 session 的 account 缓存
-3. `bindings`：`agentId` + `channel: feishu` → `match.accountId`
-4. 约定：`agentId` 与 `accounts` key 相同；或 `main` → `default`（根级 / `accounts.default` 有凭据）
-5. `resolveAgentId`：`ctx.agentId` → session 缓存 → `workspaceDir` 反查 `agents.list`
-
-`augmentHookRoutingContext` 在 `before_prompt_build` / `message_received` / `before_tool_call` 入口统一执行，便于 tool hook 回溯 agent/account。
-
-多账号计数使用 `listConfiguredFeishuAccountIds`：空的 `accounts.default: {}` 不会单独占坑，根级凭据仍计为 `default`。
-
-### 4. skill 识别仍然以绝对路径索引为主
+### 3. skill 识别仍然以绝对路径索引为主
 
 插件先扫描 skill 根目录，再把 `SKILL.md` 的绝对路径映射到 `skillName`。后续 `before_tool_call` 时，优先会把 `read` 的 path 解析成绝对路径再做匹配；如果运行时没有显式暴露 `read`，则会退回到 hook 上下文中已给出的 `skillName` / `skillCommand` / `skillsSnapshot` 来反查对应的 `SKILL.md`。
 
@@ -112,7 +98,7 @@ const blockRead = cfg.blockRead !== false;
 - [utils.js](./utils.js)
 - [utils.js](./utils.js)
 
-### 5. 同一个 skill 的授权轮询需要去重
+### 4. 同一个 skill 的授权轮询需要去重
 
 [utils.js](./utils.js) 维护了一个 `activePollingIntervals`，避免重复启动多个轮询器。
 
@@ -121,7 +107,7 @@ const blockRead = cfg.blockRead !== false;
 - [index.js](./index.js)
 - [utils.js](./utils.js)
 
-### 6. `pendingAuthNotices` 现在是正式的失败重试队列
+### 5. `pendingAuthNotices` 现在是正式的失败重试队列
 
 [index.js](./index.js) 中的 `pendingAuthNotices` 不再是单纯预留变量，而是：
 
@@ -138,7 +124,7 @@ const blockRead = cfg.blockRead !== false;
 
 这两个删之前仍然要先确认外部没有隐含依赖。
 
-### 7. 运行时健康检查已经完全收敛到飞书配置与 HTTP 调用
+### 6. 运行时健康检查已经完全收敛到飞书配置与 HTTP 调用
 
 当前版本不再依赖仓库内的 CLI 包装层。
 
