@@ -29,7 +29,8 @@
     "pack:dry": "node ./scripts/run-npm-pack.js --dry-run",
     "pack:local": "node ./scripts/run-npm-pack.js",
     "release:check": "npm run check:version && npm run test && npm run check:public && npm run pack:dry",
-    "release:publish": "node ./scripts/publish-npm.js"
+    "release:publish": "node ./scripts/publish-npm.js",
+    "release:publish:1.0.1": "node ./scripts/publish-npm.js --promote-latest"
   },
   "engines": {
     "node": ">=18.18"

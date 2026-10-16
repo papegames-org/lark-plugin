@@ -57,6 +57,10 @@ function ensureDir(dir) {
   return dir;
 }
 
+function npmCommand() {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
 function inferCacheDir() {
   // Some environments end up with root-owned ~/.npm. A per-run temp cache avoids that.
   const base = ensureDir(join(tmpdir(), "openclaw-skill-runtime-npm-cache"));
@@ -75,11 +79,12 @@ function runNpmPack({ pkgDir, destDir, dryRun }) {
   if (dryRun) argv.push("--dry-run");
   argv.push(pkgDir);
 
-  const result = spawnSync("npm", argv, {
+  const result = spawnSync(npmCommand(), argv, {
     cwd,
     env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    shell: process.platform === "win32",
   });
 
   if (result.error) {
