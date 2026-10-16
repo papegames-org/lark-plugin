@@ -149,3 +149,115 @@ export function writePendingAuthNoticeStore(filePath, notices) {
     notices: entries,
   }, null, 2));
 }
+
+export const AUTH_CARD_RECORD_SCHEMA_VERSION = 1;
+export const AUTH_CARD_RECORD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function getAuthCardRecordStorePath(options = {}) {
+  const baseDir = resolvePendingAuthBaseDir(options);
+  return join(baseDir, "plugins", "openclaw-skill-runtime", "auth-card-records.json");
+}
+
+function shouldKeepAuthCardRecord(record, nowMs = Date.now()) {
+  if (!record?.authTargetKey || !record?.authMessageId) return false;
+  const updatedAt = Number(record.updatedAt || record.createdAt || 0);
+  if (!updatedAt) return true;
+  return nowMs - updatedAt <= AUTH_CARD_RECORD_TTL_MS;
+}
+
+export function readAuthCardRecordStore(filePath, options = {}) {
+  const nowMs = Number(options.nowMs || Date.now());
+  const records = new Map();
+  if (!filePath || !existsSync(filePath)) return records;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    return records;
+  }
+  const rawRecords = Array.isArray(parsed?.records) ? parsed.records : [];
+  for (const raw of rawRecords) {
+    const authTargetKey = normalizeString(raw?.authTargetKey);
+    const authMessageId = normalizeString(raw?.authMessageId);
+    const skillName = normalizeString(raw?.skillName);
+    if (!authTargetKey || !authMessageId || !skillName) continue;
+    const record = {
+      authTargetKey,
+      authMessageId,
+      skillName,
+      accountId: normalizeString(raw?.accountId),
+      authReason: normalizeString(raw?.authReason),
+      requesterKey: normalizeString(raw?.requesterKey),
+      deviceCode: normalizeString(raw?.deviceCode),
+      missingKey: normalizeString(raw?.missingKey),
+      missing: normalizeScopes(raw?.missing),
+      requiredScopes: normalizeScopes(raw?.requiredScopes),
+      scopeInstallGrant:
+        raw?.scopeInstallGrant && typeof raw.scopeInstallGrant === "object" && !Array.isArray(raw.scopeInstallGrant)
+          ? raw.scopeInstallGrant
+          : null,
+      identity: normalizeString(raw?.identity),
+      openId: normalizeString(raw?.openId),
+      cardFinalized: raw?.cardFinalized === true,
+      createdAt: Number(raw?.createdAt || nowMs),
+      updatedAt: Number(raw?.updatedAt || nowMs),
+    };
+    if (!shouldKeepAuthCardRecord(record, nowMs)) continue;
+    records.set(authTargetKey, record);
+  }
+  return records;
+}
+
+export function writeAuthCardRecordStore(filePath, records) {
+  const entries = records instanceof Map ? [...records.values()] : [];
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: AUTH_CARD_RECORD_SCHEMA_VERSION,
+    records: entries,
+  }, null, 2));
+}
+
+export function upsertAuthCardRecord(filePath, input, nowMs = Date.now()) {
+  const authTargetKey = normalizeString(input?.authTargetKey);
+  const authMessageId = normalizeString(input?.authMessageId);
+  const skillName = normalizeString(input?.skillName);
+  if (!filePath || !authTargetKey || !authMessageId || !skillName) return null;
+  const records = readAuthCardRecordStore(filePath, { nowMs });
+  const previous = records.get(authTargetKey);
+  const next = {
+    authTargetKey,
+    authMessageId,
+    skillName,
+    accountId: normalizeString(input?.accountId) || previous?.accountId || null,
+    authReason: normalizeString(input?.authReason) || previous?.authReason || null,
+    requesterKey: normalizeString(input?.requesterKey) || previous?.requesterKey || null,
+    deviceCode: normalizeString(input?.deviceCode) || previous?.deviceCode || null,
+    missingKey: normalizeString(input?.missingKey) || previous?.missingKey || null,
+    missing: normalizeScopes(input?.missing)?.length
+      ? normalizeScopes(input?.missing)
+      : (previous?.missing || []),
+    requiredScopes: normalizeScopes(input?.requiredScopes)?.length
+      ? normalizeScopes(input?.requiredScopes)
+      : (previous?.requiredScopes || []),
+    scopeInstallGrant:
+      input?.scopeInstallGrant && typeof input.scopeInstallGrant === "object" && !Array.isArray(input.scopeInstallGrant)
+        ? input.scopeInstallGrant
+        : (previous?.scopeInstallGrant || null),
+    identity: normalizeString(input?.identity) || previous?.identity || null,
+    openId: normalizeString(input?.openId) || previous?.openId || null,
+    cardFinalized: input?.cardFinalized === true ? true : (previous?.cardFinalized === true),
+    createdAt: Number(previous?.createdAt || nowMs),
+    updatedAt: nowMs,
+  };
+  records.set(authTargetKey, next);
+  writeAuthCardRecordStore(filePath, records);
+  return next;
+}
+
+export function removeAuthCardRecord(filePath, authTargetKey, nowMs = Date.now()) {
+  const key = normalizeString(authTargetKey);
+  if (!filePath || !key) return;
+  const records = readAuthCardRecordStore(filePath, { nowMs });
+  if (!records.delete(key)) return;
+  writeAuthCardRecordStore(filePath, records);
+}
