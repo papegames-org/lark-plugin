@@ -32,6 +32,9 @@ export function formatUserFacingFailureSummary({
   const appScope = authReason === "app_scope";
   const missing = Array.isArray(missingScopes) ? missingScopes.filter(Boolean) : [];
 
+  if (state === "denied") {
+    return "你已拒绝本次飞书授权，技能已停止。如需继续，请重新触发该技能。";
+  }
   if (state === "timeout") {
     return appScope
       ? "应用权限开通轮询超时（约 3 分钟），请重新触发技能后再试。"
@@ -69,6 +72,9 @@ export function formatCardFailureHint({
   registrationError = null,
   state = null,
 } = {}) {
+  if (state === "denied") {
+    return "本次授权已拒绝，技能已停止。需要继续时请重新触发该技能。";
+  }
   if (registrationError === "access_denied" || registrationError === "expired_token") {
     return "请重新触发该 skill，并使用**新授权卡片**上的按钮（勿点历史消息里的旧链接）。";
   }

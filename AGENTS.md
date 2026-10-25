@@ -106,6 +106,8 @@ const blockRead = cfg.blockRead !== false;
 
 插件先扫描 skill 根目录，再把 `SKILL.md` 的绝对路径映射到 `skillName`。后续 `before_tool_call` 时，优先会把 `read` 的 path 解析成绝对路径再做匹配；如果运行时没有显式暴露 `read`，则会退回到 hook 上下文中已给出的 `skillName` / `skillCommand` / `skillsSnapshot` 来反查对应的 `SKILL.md`。
 
+发起授权时会扫描 `~/.openclaw/skills` 和 `~/.openclaw/workspace/<agent>/skills`，把这些目录里所有 skill 声明的 scope 与当前 skill 合并，一次申请。
+
 如果你改路径解析、workspace 推断或扫描深度，记得把这三部分一起看：
 
 - [utils.js](./utils.js)
@@ -121,7 +123,13 @@ const blockRead = cfg.blockRead !== false;
 - [index.js](./index.js)
 - [utils.js](./utils.js)
 
-### 6. `pendingAuthNotices` 现在是正式的失败重试队列
+### 6. 安装时聚合授权是显式 opt-in
+
+安装授权默认启用；只有 `installAuth.enabled: false` 才关闭。[index.js](./index.js) 会在插件注册并挂载 hook 后异步调用 [skill-auth-manifest.js](./skill-auth-manifest.js)，扫描配置的 skill roots 和 `agents.list[].workspace/skills`，按飞书应用聚合全部 `larkAuth` scope。收卡人优先使用显式 `installAuth.openId`；未配置时从匹配应用的 `lark-cli auth status --verify` 中选择唯一已验证用户。启动时没有可用用户身份时，`message_received` 可使用当前飞书消息发送人重试。多个 profile 时不得猜测，可用 `installAuth.profile` 消歧。
+
+这个能力复用现有 `startLogin`、`sendAuthCard`、`startWaitForAuth`，不替代运行时 `before_tool_call` 的校验和阻断。没有接收人时只记录日志并跳过；安装级聚合没有单一 `skillPath`，因此发卡失败不会写入 `pendingAuthNotices` 队列。
+
+### 7. `pendingAuthNotices` 现在是正式的失败重试队列
 
 [index.js](./index.js) 中的 `pendingAuthNotices` 不再是单纯预留变量，而是：
 
@@ -138,7 +146,7 @@ const blockRead = cfg.blockRead !== false;
 
 这两个删之前仍然要先确认外部没有隐含依赖。
 
-### 7. 运行时健康检查已经完全收敛到飞书配置与 HTTP 调用
+### 8. 运行时健康检查已经完全收敛到飞书配置与 HTTP 调用
 
 当前版本不再依赖仓库内的 CLI 包装层。
 

@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createPluginEntry } from "../index.js";
@@ -760,6 +762,561 @@ test("before_tool_call allows app identity skill when app identity scopes are op
   assert.equal(captured.checkScopes[0].identity, "app");
   assert.equal(captured.sendAuthCard.length, 0);
   assert.equal(result, undefined);
+  } finally {
+    env.restore();
+  }
+});
+
+test("before_tool_call requests every scope declared under .openclaw/skills", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-bundle-");
+  try {
+    const skillsRoot = join(env.dataDir, "skills");
+    mkdirSync(join(skillsRoot, "alpha"), { recursive: true });
+    mkdirSync(join(skillsRoot, "beta"), { recursive: true });
+    const alphaPath = join(skillsRoot, "alpha", "SKILL.md");
+    writeFileSync(alphaPath, `---
+larkAuth:
+  identity: user
+  scopes:
+    - im:message
+---
+`);
+    writeFileSync(join(skillsRoot, "beta", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  scopes:
+    - contact:user.base:readonly
+---
+`);
+
+    const handlers = new Map();
+    const captured = { startLogin: [] };
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      resetRuntimeCaches,
+      getPendingAuthNoticeStorePath() {
+        return join(env.dataDir, "pending-auth-notices.json");
+      },
+      readPendingAuthNoticeStore() {
+        return new Map();
+      },
+      writePendingAuthNoticeStore() {},
+      buildSkillRootsCacheKey() {
+        return "bundle-roots";
+      },
+      getDefaultSkillRoots() {
+        return [];
+      },
+      buildSkillMap() {
+        return new Map();
+      },
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      cacheSenderId() {},
+      getCachedSenderId() {
+        return "ou_bundle_123";
+      },
+      resolveWorkspaceDir() {
+        return null;
+      },
+      resolveSkillReadTarget,
+      ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+      checkScopes: async (scopes) => ({ ok: false, missing: scopes, granted: [] }),
+      startLogin: async (scopes, _ctx, options) => {
+        captured.startLogin.push({ scopes, requiredScopes: options.requiredScopes });
+        return {
+          verificationUrl: "https://example.com/auth",
+          userCode: "USERCODE",
+          deviceCode: "DEVICECODE",
+        };
+      },
+      checkUserGrant: async () => ({ ok: false, missing: ["contact:user.base:readonly"], granted: [] }),
+      getAuthedUser: async () => ({ openId: "ou_bundle_123" }),
+      sendAuthCard: async () => ({ messageId: "msg_bundle" }),
+      startWaitForAuth() {},
+    });
+
+    plugin.register({
+      config: {
+        channels: {
+          feishu: {
+            accounts: {
+              "acc-a": { appId: "cli_test", appSecret: "secret_test" },
+            },
+          },
+        },
+      },
+      pluginConfig: { enabled: true, blockRead: true },
+      log: { info() {}, warn() {} },
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+    });
+
+    await handlers.get("message_received")(
+      { accountId: "acc-a", senderId: "ou_bundle_123" },
+      { sessionId: "session-bundle", sessionKey: "session-key-bundle", channel: "feishu" },
+    );
+
+    const result = await handlers.get("before_tool_call")(
+      { toolName: "read", params: { path: alphaPath } },
+      {
+        channel: "feishu",
+        sessionId: "session-bundle",
+        sessionKey: "session-key-bundle",
+        accountId: "acc-a",
+        cwd: "/",
+      },
+    );
+
+    assert.equal(result?.block, true);
+    assert.equal(captured.startLogin.length, 1);
+    assert.deepEqual(captured.startLogin[0].requiredScopes, ["contact:user.base:readonly", "im:message"]);
+    assert.deepEqual(captured.startLogin[0].scopes, ["contact:user.base:readonly", "im:message"]);
+  } finally {
+    env.restore();
+  }
+});
+
+test("register sends one install auth card for all configured skill scopes", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-install-auth-");
+  try {
+    const skillsRoot = join(env.dataDir, "install-skills");
+    mkdirSync(join(skillsRoot, "alpha"), { recursive: true });
+    mkdirSync(join(skillsRoot, "beta"), { recursive: true });
+    writeFileSync(join(skillsRoot, "alpha", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  appScopes:
+    - im:message:send_as_bot
+---
+`);
+    writeFileSync(join(skillsRoot, "beta", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  userScopes:
+    - contact:user.base:readonly
+---
+`);
+
+    const handlers = new Map();
+    const captured = { startLogin: [], sendAuthCard: [], startWaitForAuth: [] };
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      resetRuntimeCaches,
+      getPendingAuthNoticeStorePath() {
+        return join(env.dataDir, "pending-auth-notices.json");
+      },
+      readPendingAuthNoticeStore() {
+        return new Map();
+      },
+      writePendingAuthNoticeStore() {},
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      ensureFeishuRuntimeHealth: async () => ({ ok: true, accountId: "acc-a", appId: "cli_test" }),
+      resolveInstallAuthRecipient: async () => ({
+        ok: true,
+        accountId: "acc-a",
+        appId: "cli_test",
+        profile: "profile-install",
+        openId: "ou_admin_123",
+        source: "explicit-config",
+      }),
+      getAppScopeEntries: async () => [],
+      checkScopes: async (scopes) => ({ ok: false, missing: scopes, granted: [] }),
+      checkUserGrant: async () => ({ ok: false, missing: ["contact:user.base:readonly"], granted: [] }),
+      startLogin: async (scopes, ctx, options) => {
+        captured.startLogin.push({ scopes, ctx, options });
+        return {
+          verificationUrl: "https://example.com/install-auth",
+          userCode: "INSTALL",
+          deviceCode: "DEVICE",
+          requestedScopes: options.requiredScopes,
+          scopeGrantDual: true,
+        };
+      },
+      sendAuthCard: async (payload) => {
+        captured.sendAuthCard.push(payload);
+        return { messageId: "msg_install" };
+      },
+      startWaitForAuth(payload) {
+        captured.startWaitForAuth.push(payload);
+      },
+    });
+
+    plugin.register({
+      config: {
+        channels: {
+          feishu: {
+            accounts: {
+              "acc-a": { appId: "cli_test", appSecret: "secret_test" },
+            },
+          },
+        },
+      },
+      pluginConfig: {
+        enabled: true,
+        blockRead: true,
+        skillRoots: [skillsRoot],
+        installAuth: {
+          enabled: true,
+          receiveId: "ou_admin_123",
+          receiveIdType: "open_id",
+        },
+      },
+      log: { info() {}, warn() {} },
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(captured.startLogin.length, 1);
+    assert.deepEqual(captured.startLogin[0].options.requiredScopes, [
+      "contact:user.base:readonly",
+      "im:message:send_as_bot",
+    ]);
+    assert.equal(captured.startLogin[0].options.identity, "user");
+    assert.equal(captured.sendAuthCard.length, 1);
+    assert.equal(captured.sendAuthCard[0].skillName, "openclaw-managed-skills");
+    assert.deepEqual(captured.sendAuthCard[0].missing, [
+      "contact:user.base:readonly",
+      "im:message:send_as_bot",
+    ]);
+    assertAuthCardRecipient(captured.sendAuthCard[0], "ou_admin_123");
+    assert.equal(captured.startWaitForAuth.length, 1);
+    assert.equal(captured.startWaitForAuth[0].authTargetKey, "acc-a::install-auth::feishu:cli_test");
+  } finally {
+    env.restore();
+  }
+});
+
+test("register auto-discovers a verified recipient without installAuth config", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-auto-install-auth-");
+  try {
+    const captured = { hooks: [], cards: [], logins: [], waits: [] };
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      setPluginApiRef() {},
+      setPluginConfigRef() {},
+      resetRuntimeCaches() {},
+      syncLarkCliProfiles() {},
+      ensureFeishuRuntimeHealth: async () => ({ ok: true, accountId: "default", appId: "cli_auto" }),
+      getPendingAuthNoticeStorePath: () => join(env.dataDir, "pending.json"),
+      readPendingAuthNoticeStore: () => new Map(),
+      writePendingAuthNoticeStore() {},
+      collectSkillAuthManifest: () => ({
+        complete: true,
+        hash: "manifest-auto",
+        apps: [{
+          key: "feishu:cli_auto",
+          accountId: "default",
+          appId: "cli_auto",
+          installScopes: { app: ["im:message"], user: [], unknown: [] },
+          personalOAuthScopes: [],
+        }],
+        unresolved: [],
+        errors: [],
+        totals: { skills: 1, skillsWithAuth: 1 },
+      }),
+      resolveInstallAuthRecipient: async () => ({
+        ok: true,
+        accountId: "default",
+        appId: "cli_auto",
+        profile: "profile-auto",
+        openId: "ou_auto",
+        source: "verified-profile",
+      }),
+      getAppScopeEntries: async () => [],
+      checkScopes: async (scopes) => ({ ok: false, missing: scopes, granted: [] }),
+      startLogin: async (scopes, _ctx, options) => {
+        captured.logins.push({ scopes, options });
+        return {
+          verificationUrl: "https://example.com/install-auth",
+          deviceCode: "device-auto",
+          requestedScopes: scopes,
+        };
+      },
+      sendAuthCard: async (payload) => {
+        captured.cards.push(payload);
+        return { messageId: "msg_auto" };
+      },
+      startWaitForAuth(payload) { captured.waits.push(payload); },
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      getDefaultSkillRoots: () => [],
+    });
+
+    plugin.register({
+      config: {
+        channels: {
+          feishu: {
+            accounts: {
+              default: { appId: "cli_auto", appSecret: "secret" },
+            },
+          },
+        },
+      },
+      pluginConfig: { enabled: true },
+      log: { info() {}, warn() {} },
+      on(name) { captured.hooks.push(name); },
+    });
+
+    assert.ok(captured.hooks.includes("before_tool_call"));
+    assert.equal(captured.cards.length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(captured.cards.length, 1);
+    assertAuthCardRecipient(captured.cards[0], "ou_auto");
+    assert.equal(captured.logins[0].options.larkProfile, "profile-auto");
+    assert.equal(captured.waits[0].larkProfile, "profile-auto");
+  } finally {
+    env.restore();
+  }
+});
+
+test("message_received can retry install auth with the current Feishu sender", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-sender-install-auth-");
+  try {
+    const captured = { cards: [], logins: [], waits: [], resolveRecipient: [] };
+    const handlers = new Map();
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      setPluginApiRef() {},
+      setPluginConfigRef() {},
+      resetRuntimeCaches() {},
+      syncLarkCliProfiles() {},
+      ensureFeishuRuntimeHealth: async () => ({ ok: true, accountId: "default", appId: "cli_sender" }),
+      getPendingAuthNoticeStorePath: () => join(env.dataDir, "pending.json"),
+      readPendingAuthNoticeStore: () => new Map(),
+      writePendingAuthNoticeStore() {},
+      collectSkillAuthManifest: () => ({
+        complete: true,
+        hash: "manifest-sender",
+        apps: [{
+          key: "feishu:cli_sender",
+          accountId: "default",
+          appId: "cli_sender",
+          installScopes: { app: [], user: ["contact:user.base:readonly"], unknown: [] },
+          personalOAuthScopes: [],
+        }],
+        unresolved: [],
+        errors: [],
+        totals: { skills: 1, skillsWithAuth: 1 },
+      }),
+      resolveInstallAuthRecipient: async (_ctx, options) => {
+        captured.resolveRecipient.push(options);
+        if (options?.openId === "ou_sender_install_123") {
+          return {
+            ok: true,
+            accountId: "default",
+            appId: "cli_sender",
+            profile: "profile-bootstrap",
+            openId: "ou_sender_install_123",
+            source: "explicit-config",
+            bootstrap: true,
+          };
+        }
+        return { ok: false, reasonCode: "recipient_unavailable" };
+      },
+      getAppScopeEntries: async () => [],
+      checkScopes: async (scopes) => ({ ok: false, missing: scopes, granted: [] }),
+      startLogin: async (scopes, _ctx, options) => {
+        captured.logins.push({ scopes, options });
+        return {
+          verificationUrl: "https://example.com/install-auth",
+          deviceCode: "device-sender",
+          requestedScopes: scopes,
+        };
+      },
+      sendAuthCard: async (payload) => {
+        captured.cards.push(payload);
+        return { messageId: "msg_sender" };
+      },
+      startWaitForAuth(payload) { captured.waits.push(payload); },
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      getDefaultSkillRoots: () => [],
+    });
+
+    plugin.register({
+      config: {
+        channels: {
+          feishu: {
+            accounts: {
+              default: { appId: "cli_sender", appSecret: "secret" },
+            },
+          },
+        },
+      },
+      pluginConfig: { enabled: true },
+      log: { info() {}, warn() {} },
+      on(name, handler) { handlers.set(name, handler); },
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(captured.cards.length, 0);
+
+    await handlers.get("message_received")(
+      { senderId: "ou_sender_install_123" },
+      {
+        channel: "feishu",
+        messageProvider: "feishu",
+        accountId: "default",
+        sessionId: "session-sender-install",
+        senderId: "ou_sender_install_123",
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(captured.cards.length, 1);
+    assertAuthCardRecipient(captured.cards[0], "ou_sender_install_123");
+    assert.ok(captured.resolveRecipient.some((options) => options?.openId === "ou_sender_install_123"));
+    assert.equal(captured.logins[0].options.larkProfile, "profile-bootstrap");
+    assert.equal(captured.waits[0].openId, "ou_sender_install_123");
+    assert.equal(captured.waits[0].larkProfile, "profile-bootstrap");
+  } finally {
+    env.restore();
+  }
+});
+
+test("rejected auth gate stops every skill until the rejected skill is triggered again", async () => {
+  const env = isolateOpenClawDataDir("openclaw-skill-runtime-index-");
+  try {
+    const handlers = new Map();
+    const captured = { sendAuthCard: [], startWaitForAuth: [] };
+    const otherSkillPath = "/tmp/papergames-email-summary/SKILL.md";
+    const plugin = createPluginEntry({
+      fileLog() {},
+      logCtxSnapshotOnce() {},
+      setApiConfigRef() {},
+      setPluginApiRef() {},
+      resetRuntimeCaches,
+      getPendingAuthNoticeStorePath() {
+        return "/tmp/openclaw-skill-runtime-index-test-rejected-all.json";
+      },
+      readPendingAuthNoticeStore() {
+        return new Map();
+      },
+      writePendingAuthNoticeStore() {},
+      buildSkillRootsCacheKey() {
+        return "rejected-all";
+      },
+      getDefaultSkillRoots() {
+        return [];
+      },
+      buildSkillMap() {
+        return new Map([
+          [basicSkillPath, "feishu-auth-basic"],
+          [otherSkillPath, "papergames-email-summary"],
+        ]);
+      },
+      cachedAccountBySession: new Map(),
+      cachedWorkspaceBySession: new Map(),
+      cacheSenderId() {},
+      getCachedSenderId() {
+        return "ou_test_123";
+      },
+      resolveWorkspaceDir() {
+        return null;
+      },
+      resolveSkillReadTarget,
+      readLarkAuth() {
+        return { identity: "user", scopes: ["contact:user.base:readonly"] };
+      },
+      ensureFeishuRuntimeHealth: async () => ({ ok: true }),
+      getAppScopeEntries: async () => [],
+      checkScopes: async () => ({
+        ok: false,
+        missing: ["contact:user.base:readonly"],
+        granted: [],
+      }),
+      startLogin: async () => ({
+        verificationUrl: "https://example.com/auth",
+        userCode: "USERCODE",
+        deviceCode: "DEVICECODE",
+      }),
+      checkUserGrant: async () => ({
+        ok: false,
+        missing: ["contact:user.base:readonly"],
+        granted: [],
+      }),
+      getAuthedUser: async () => ({ openId: "ou_test_123" }),
+      sendAuthCard: async (payload) => {
+        captured.sendAuthCard.push(payload);
+        return { messageId: `msg_${captured.sendAuthCard.length}` };
+      },
+      startWaitForAuth(payload) {
+        captured.startWaitForAuth.push(payload);
+      },
+    });
+
+    plugin.register({
+      config: {
+        channels: {
+          feishu: {
+            accounts: {
+              "acc-a": { appId: "cli_test", appSecret: "secret_test" },
+            },
+          },
+        },
+      },
+      pluginConfig: { enabled: true, blockRead: true },
+      log: { info() {}, warn() {} },
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+    });
+
+    const ctx = {
+      channel: "feishu",
+      sessionId: "session-rejected",
+      sessionKey: "session-key-rejected",
+      accountId: "acc-a",
+      cwd: "/",
+    };
+    await handlers.get("message_received")(
+      { accountId: "acc-a", senderId: "ou_test_123" },
+      ctx,
+    );
+    const first = await handlers.get("before_tool_call")(
+      { toolName: "read", params: { path: basicSkillPath } },
+      ctx,
+    );
+    assert.equal(first?.block, true);
+    captured.startWaitForAuth[0].onCleanup({ reason: "denied" });
+
+    const otherSkill = await handlers.get("before_tool_call")(
+      { toolName: "read", params: { path: otherSkillPath } },
+      ctx,
+    );
+    assert.equal(otherSkill?.block, true);
+    assert.match(otherSkill?.reason || "", /当前会话中的技能已全部停止/);
+
+    const otherPrompt = await handlers.get("before_prompt_build")(
+      { messages: [{ role: "user", content: "严格执行 papergames-email-summary技能" }] },
+      ctx,
+    );
+    assert.equal(otherPrompt?.block, true);
+    assert.match(otherPrompt?.reason || "", /已发送授权卡片/);
+    assert.equal(captured.sendAuthCard.at(-1)?.skillName, "papergames-email-summary");
+    captured.startWaitForAuth.at(-1).onCleanup({ reason: "denied" });
+
+    const retryPrompt = await handlers.get("before_prompt_build")(
+      { messages: [{ role: "user", content: "重新触发 feishu-auth-basic" }] },
+      ctx,
+    );
+    assert.equal(retryPrompt?.block, true);
+    assert.match(retryPrompt?.reason || "", /已发送授权卡片/);
+    assert.equal(captured.sendAuthCard.at(-1)?.skillName, "feishu-auth-basic");
   } finally {
     env.restore();
   }

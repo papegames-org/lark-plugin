@@ -1,17 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   buildSkillRootsCacheKey,
   cacheSenderId,
   checkUserGrant,
+  collectLarkAuthFromSkillRoot,
+  expandLarkAuthWithManagedSkills,
+  inferOpenClawHomeFromSkillPath,
+  listOpenClawBundledSkillRoots,
   getCachedSenderId,
   getDefaultSkillRoots,
   getAccountCredentials,
   inferSenderIdFromCtx,
   getSkillAuthCacheKey,
   resolveSkillReadTarget,
+  resolveInstallAuthRecipient,
   sendAuthCard,
   startLogin,
   startWaitForAuth,
@@ -21,8 +27,12 @@ import {
   setLarkCliCommandRunnerForTest,
   setLarkCliDeviceWaitSpawnerForTest,
   selectAuthedUserProfile,
+  checkScopes,
   normalizeAppScopeEntries,
+  retainGrantedTenantScopes,
   normalizeAuthIdentity,
+  selectExplicitSkillNames,
+  isUserGrantWaiterDenial,
 } from "../utils.js";
 import { createLarkCliCommandRunner, okLarkCliResult } from "./helpers/lark-cli-mock.js";
 import { normalizePathForAssert } from "./helpers/test-env.js";
@@ -30,8 +40,141 @@ import { normalizePathForAssert } from "./helpers/test-env.js";
 test("getDefaultSkillRoots includes agent and OpenClaw global skill roots", () => {
   assert.deepEqual(getDefaultSkillRoots({}).map(normalizePathForAssert), [
     normalizePathForAssert(join(homedir(), ".agents", "skills")),
+    normalizePathForAssert(join(homedir(), ".openclaw", "skills")),
     normalizePathForAssert(join(homedir(), ".openclaw", "workspace", "skills")),
   ]);
+});
+
+test("collectLarkAuthFromSkillRoot unions every skill declaration", () => {
+  const root = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-managed-auth-"));
+  try {
+    const skillsRoot = join(root, "skills");
+    mkdirSync(join(skillsRoot, "alpha"), { recursive: true });
+    mkdirSync(join(skillsRoot, "beta"), { recursive: true });
+    mkdirSync(join(skillsRoot, "plain"), { recursive: true });
+    writeFileSync(join(skillsRoot, "alpha", "SKILL.md"), `---
+larkAuth:
+  identity: app
+  appScopes:
+    - im:message
+---
+`);
+    writeFileSync(join(skillsRoot, "beta", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  scopes:
+    - contact:user.base:readonly
+  userScopes:
+    - contact:user.base:readonly
+---
+`);
+    writeFileSync(join(skillsRoot, "plain", "SKILL.md"), `---
+name: plain
+---
+`);
+
+    const collected = collectLarkAuthFromSkillRoot(skillsRoot);
+    assert.equal(collected.identity, "user");
+    assert.equal(collected.skillCount, 2);
+    assert.deepEqual(collected.scopes, ["contact:user.base:readonly", "im:message"]);
+    assert.equal(collected.scopeInstallGrant["im:message"], "app");
+    assert.equal(collected.scopeInstallGrant["contact:user.base:readonly"], "user");
+
+    const expanded = expandLarkAuthWithManagedSkills({
+      identity: "user",
+      scopes: ["docs:document:readonly"],
+      scopeInstallGrant: { "docs:document:readonly": "user" },
+    }, { root: skillsRoot });
+    assert.equal(expanded.bundled, true);
+    assert.deepEqual(expanded.auth.scopes, [
+      "contact:user.base:readonly",
+      "docs:document:readonly",
+      "im:message",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("listOpenClawBundledSkillRoots includes agent workspace skill directories", () => {
+  const home = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-agent-skills-"));
+  try {
+    const agentSkills = join(home, "workspace", "workbench-agent", "skills");
+    const currentSkill = join(agentSkills, "papergames-weekly-report", "SKILL.md");
+    mkdirSync(join(agentSkills, "papergames-weekly-report"), { recursive: true });
+    mkdirSync(join(agentSkills, "other-skill"), { recursive: true });
+    writeFileSync(currentSkill, `---
+larkAuth:
+  identity: user
+  scopes:
+    - im:message
+---
+`);
+    writeFileSync(join(agentSkills, "other-skill", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  scopes:
+    - contact:user.base:readonly
+    - user:ou_4fc048c59c4820feda9d591cd213b480
+---
+`);
+
+    const remoteSkill = "/root/.openclaw/workspace/workbench-agent/skills/papergames-weekly-report/SKILL.md";
+    assert.equal(
+      normalizePathForAssert(inferOpenClawHomeFromSkillPath(remoteSkill)),
+      normalizePathForAssert(resolve("/root/.openclaw")),
+    );
+    const roots = listOpenClawBundledSkillRoots({ openclawHome: home, skillPath: currentSkill });
+    assert.ok(roots.some((root) => normalizePathForAssert(root) === normalizePathForAssert(agentSkills)));
+
+    const expanded = expandLarkAuthWithManagedSkills({
+      identity: "user",
+      scopes: ["im:message"],
+      scopeInstallGrant: {},
+    }, { openclawHome: home, skillPath: currentSkill });
+    assert.equal(expanded.bundled, true);
+    assert.equal(expanded.skillCount, 2);
+    assert.deepEqual(expanded.auth.scopes, ["contact:user.base:readonly", "im:message"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("expandLarkAuthWithManagedSkills reads skills installed in ~/.openclaw/workspace/skills", () => {
+  const home = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-workspace-skills-"));
+  try {
+    const sharedSkills = join(home, "workspace", "skills");
+    mkdirSync(join(sharedSkills, "papergames-weekly-report"), { recursive: true });
+    mkdirSync(join(sharedSkills, "byted-web-search"), { recursive: true });
+    writeFileSync(join(sharedSkills, "papergames-weekly-report", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  scopes:
+    - im:message
+---
+`);
+    writeFileSync(join(sharedSkills, "byted-web-search", "SKILL.md"), `---
+larkAuth:
+  identity: user
+  scopes:
+    - search:message
+---
+`);
+    const currentSkill = "/root/.openclaw/workspace/skills/papergames-weekly-report/SKILL.md";
+    const roots = listOpenClawBundledSkillRoots({ openclawHome: home, skillPath: currentSkill });
+    assert.ok(roots.some((root) => normalizePathForAssert(root) === normalizePathForAssert(sharedSkills)));
+
+    const expanded = expandLarkAuthWithManagedSkills({
+      identity: "user",
+      scopes: ["im:message"],
+      scopeInstallGrant: {},
+    }, { openclawHome: home, skillPath: currentSkill });
+    assert.equal(expanded.bundled, true);
+    assert.equal(expanded.skillCount, 2);
+    assert.deepEqual(expanded.auth.scopes, ["im:message", "search:message"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("buildSkillRootsCacheKey is stable across root ordering", () => {
@@ -56,6 +199,72 @@ test("selectAuthedUserProfile falls back to accountId match", () => {
   ], { accountId: "acc-b" });
 
   assert.equal(selected?.openId, "ou-b");
+});
+
+test("resolveInstallAuthRecipient discovers one verified matching profile", async () => {
+  const calls = [];
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli-auto", appSecret: "secret" },
+        },
+      },
+    },
+  });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls,
+    appId: "cli-auto",
+    openId: "ou_auto",
+    profiles: [{ name: "auto-profile", appId: "cli-auto" }],
+  }));
+
+  try {
+    const result = await resolveInstallAuthRecipient({ accountId: "default" });
+    assert.deepEqual(result, {
+      ok: true,
+      accountId: "default",
+      appId: "cli-auto",
+      profile: "auto-profile",
+      openId: "ou_auto",
+      source: "verified-profile",
+    });
+    assert.ok(calls.some((args) => args[0] === "--profile" && args[1] === "auto-profile"));
+  } finally {
+    setLarkCliCommandRunnerForTest(null);
+    setApiConfigRef(null);
+    resetRuntimeCaches();
+  }
+});
+
+test("resolveInstallAuthRecipient rejects multiple verified profiles", async () => {
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli-auto", appSecret: "secret" },
+        },
+      },
+    },
+  });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    appId: "cli-auto",
+    openId: "ou_auto",
+    profiles: [
+      { name: "profile-a", appId: "cli-auto" },
+      { name: "profile-b", appId: "cli-auto" },
+    ],
+  }));
+
+  try {
+    const result = await resolveInstallAuthRecipient({ accountId: "default" });
+    assert.equal(result.ok, false);
+    assert.equal(result.reasonCode, "recipient_ambiguous");
+  } finally {
+    setLarkCliCommandRunnerForTest(null);
+    setApiConfigRef(null);
+    resetRuntimeCaches();
+  }
 });
 
 test("getSkillAuthCacheKey isolates same skill path by account", () => {
@@ -173,6 +382,61 @@ test("getAccountCredentials ignores legacy unknown accountId and falls back to t
   });
 });
 
+test("revoked tenant scopes are missing on the next skill scope check", async () => {
+  const catalog = normalizeAppScopeEntries([
+    { scope: "contact:user.base:readonly", identity_type: "user" },
+    { scope: "im:message", identity_type: "user" },
+  ]);
+  const entries = retainGrantedTenantScopes(catalog, [
+    { scope_name: "contact:user.base:readonly", grant_status: 1 },
+    { scope_name: "im:message", grant_status: 2 },
+  ]);
+  const result = await checkScopes(
+    ["contact:user.base:readonly", "im:message"],
+    {},
+    { identity: "user", appScopeEntries: entries },
+  );
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.missing, ["im:message"]);
+  assert.deepEqual(result.granted, ["contact:user.base:readonly"]);
+});
+
+test("explicit skill name does not treat a shorter prefix as the requested skill", () => {
+  const text = "使用技能papergames-weekly-report-lite严格按照流程，生成本周的周报";
+  const names = selectExplicitSkillNames(text, [
+    "papergames-weekly-report",
+    "papergames-weekly-report-lite",
+    "byted-web-search",
+  ]);
+  assert.deepEqual(names, ["papergames-weekly-report-lite"]);
+
+  const skillMap = new Map([
+    ["/root/.openclaw/workspace/skills/papergames-weekly-report-lite/SKILL.md", "papergames-weekly-report-lite"],
+    ["/root/.openclaw/workspace/skills/papergames-weekly-report/SKILL.md", "papergames-weekly-report"],
+  ]);
+  assert.deepEqual(selectExplicitSkillNames(text, skillMap), ["papergames-weekly-report-lite"]);
+  assert.deepEqual(selectExplicitSkillNames(text, skillMap.values()), ["papergames-weekly-report-lite"]);
+  assert.deepEqual(selectExplicitSkillNames(text, [...skillMap.keys()]), ["papergames-weekly-report-lite"]);
+});
+
+test("user grant waiter denial is recognized before the success grace period", () => {
+  assert.equal(isUserGrantWaiterDenial({
+    exited: true,
+    exitCode: 1,
+    output: "error: access_denied",
+  }), true);
+  assert.equal(isUserGrantWaiterDenial({
+    denied: true,
+    exited: false,
+    exitCode: null,
+  }), true);
+  assert.equal(isUserGrantWaiterDenial({
+    exited: true,
+    exitCode: 0,
+    output: "",
+  }), false);
+});
+
 test("normalizeAppScopeEntries preserves identity for duplicate scope strings", () => {
   const entries = normalizeAppScopeEntries([
     { scope: "application:app_slash_command:read", identity_type: "app" },
@@ -224,6 +488,42 @@ test("checkUserGrant falls back to lark-cli auth check when runtime checker is u
     else process.env.LARK_PROFILE_NAME = oldLarkProfile;
     setLarkCliCommandRunnerForTest(null);
     setPluginApiRef(null);
+  }
+});
+
+test("checkUserGrant keeps the verified lark profile", async () => {
+  const calls = [];
+  setPluginApiRef(null);
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli_profile", appSecret: "secret" },
+        },
+      },
+    },
+  });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls,
+    appId: "cli_profile",
+    openId: "ou_profile",
+    grantedScopes: ["scope:a"],
+  }));
+
+  try {
+    const result = await checkUserGrant(
+      "ou_profile",
+      ["scope:a"],
+      { accountId: "default" },
+      { larkProfile: "profile-b", requireScopeDetails: true },
+    );
+    assert.equal(result.ok, true);
+    assert.ok(calls.some((args) => args[0] === "--profile" && args[1] === "profile-b" && args[2] === "auth"));
+  } finally {
+    setLarkCliCommandRunnerForTest(null);
+    setPluginApiRef(null);
+    setApiConfigRef(null);
+    resetRuntimeCaches();
   }
 });
 
@@ -357,6 +657,45 @@ test("startLogin uses lark-cli device flow for user grants", async () => {
   }
 });
 
+test("startLogin keeps the selected lark profile for user grants", async () => {
+  const commandCalls = [];
+  const spawnCalls = [];
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli_profile", appSecret: "secret" },
+        },
+      },
+    },
+  });
+  setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls: commandCalls,
+    appId: "cli_profile",
+  }));
+  setLarkCliDeviceWaitSpawnerForTest((args) => {
+    spawnCalls.push(args);
+    return { started: true, pid: 5678 };
+  });
+
+  try {
+    const result = await startLogin(
+      ["scope:a"],
+      { accountId: "default" },
+      { identity: "user", authReason: "user_grant", larkProfile: "profile-b" },
+    );
+    assert.equal(result.provider, "lark-cli");
+    assert.ok(commandCalls.some((args) => args[0] === "--profile" && args[1] === "profile-b" && args[2] === "config"));
+    assert.ok(commandCalls.some((args) => args[0] === "--profile" && args[1] === "profile-b" && args[2] === "auth"));
+    assert.ok(spawnCalls.some((args) => args[0] === "--profile" && args[1] === "profile-b"));
+  } finally {
+    setLarkCliCommandRunnerForTest(null);
+    setLarkCliDeviceWaitSpawnerForTest(null);
+    setApiConfigRef(null);
+    resetRuntimeCaches();
+  }
+});
+
 test("startWaitForAuth polls app-scope completion without app device code", async () => {
   const oldFetch = globalThis.fetch;
   const oldProfile = process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
@@ -407,6 +746,19 @@ test("startWaitForAuth polls app-scope completion without app device code", asyn
               app: {
                 scopes: [{ scope: "scope:a", identity_type: "user" }],
               },
+            },
+          };
+        },
+      };
+    }
+    if (href.includes("/open-apis/application/v6/scopes")) {
+      return {
+        ok: true,
+        async json() {
+          return {
+            code: 0,
+            data: {
+              scopes: [{ scope_name: "scope:a", grant_status: 1 }],
             },
           };
         },
@@ -473,6 +825,78 @@ test("startWaitForAuth polls app-scope completion without app device code", asyn
     resetRuntimeCaches();
   }
 });
+test("registrationReady does not override missing app scopes", async () => {
+  const oldFetch = globalThis.fetch;
+  resetRuntimeCaches();
+  setApiConfigRef({
+    channels: {
+      feishu: {
+        accounts: {
+          default: { appId: "cli_registration_only", appSecret: "secret_test" },
+        },
+      },
+    },
+  });
+
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    if (href.includes("/oauth/v1/app/registration")) {
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ token: "mock" }); },
+      };
+    }
+    if (href.includes("tenant_access_token")) {
+      return {
+        ok: true,
+        async json() {
+          return { code: 0, tenant_access_token: "tenant-token", expire: 7200 };
+        },
+      };
+    }
+    if (href.includes("/open-apis/application/v6/applications/cli_registration_only")) {
+      return {
+        ok: true,
+        async json() {
+          return {
+            code: 0,
+            data: { app: { scopes: [{ scope: "scope:a", identity_type: "app" }] } },
+          };
+        },
+      };
+    }
+    if (href.includes("/open-apis/application/v6/scopes")) {
+      return {
+        ok: true,
+        async json() { return { code: 0, data: { scopes: [] } }; },
+      };
+    }
+    throw new Error(`unexpected fetch ${href}`);
+  };
+
+  let authorized = false;
+  try {
+    startWaitForAuth({
+      authTargetKey: "registration-only",
+      skillName: "registration-only",
+      deviceCode: "device-registration-only",
+      missingKey: "scope:a",
+      scopes: ["scope:a"],
+      identity: "app",
+      authReason: "app_scope",
+      ctx: { accountId: "default" },
+      onAuthorized() { authorized = true; },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(authorized, false);
+  } finally {
+    globalThis.fetch = oldFetch;
+    setApiConfigRef(null);
+    resetRuntimeCaches();
+  }
+});
 test("startWaitForAuth chains app-scope success into user-grant auth for user identity skills", async () => {
   const oldFetch = globalThis.fetch;
   const oldProfile = process.env.OPENCLAW_SKILL_RUNTIME_LARK_PROFILE;
@@ -531,11 +955,29 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
         },
       };
     }
+    if (href.includes("/open-apis/application/v6/scopes")) {
+      return {
+        ok: true,
+        async json() {
+          return {
+            code: 0,
+            data: {
+              scopes: [
+                { scope_name: "scope:a", grant_status: 1 },
+                { scope_name: "scope:b", grant_status: 1 },
+              ],
+            },
+          };
+        },
+      };
+    }
     throw new Error(`unexpected fetch ${href}`);
   };
 
   let statusVerifyCount = 0;
+  const larkCliCalls = [];
   setLarkCliCommandRunnerForTest(createLarkCliCommandRunner({
+    calls: larkCliCalls,
     appId: "cli_test",
     openId: "ou_test",
     grantedScopes: [],
@@ -568,6 +1010,7 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
       requiredScopes: ["scope:a", "scope:b"],
       identity: "user",
       authReason: "app_scope",
+      larkProfile: "profile-b",
       ctx: { accountId: "default" },
       authMessageId: "msg_app_scope",
     });
@@ -575,6 +1018,7 @@ test("startWaitForAuth chains app-scope success into user-grant auth for user id
     await new Promise((resolve) => setTimeout(resolve, 25));
 
     assert.ok(statusVerifyCount >= 1);
+    assert.ok(larkCliCalls.some((args) => args[0] === "--profile" && args[1] === "profile-b" && args[2] === "auth"));
     const userGrantUpdate = sentCards.find((card) => card.action === "update" && card.message_id === "msg_app_scope");
     assert.ok(userGrantUpdate);
     const userGrantCard = JSON.parse(userGrantUpdate.content);

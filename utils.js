@@ -20,6 +20,7 @@ import {
   resolveFeishuBrand,
   uploadImFile,
 } from "./feishu-runtime.js";
+import { isUserOpenIdScope, readLarkAuth } from "./parse-meta.js";
 import {
   buildDiagnosticDocument,
   formatCardFailureHint,
@@ -83,7 +84,7 @@ export function resetRuntimeCaches() {
 // ---------- 日志 ----------
 
 /** grep 用：确认 Gateway 已加载含 scopeGrantDevicePoll 的版本 */
-export const PLUGIN_RUNTIME_BUILD = "1.0.1+authDiagnostics.8";
+export const PLUGIN_RUNTIME_BUILD = "2.0.5+authDiagnostics.8";
 
 /** 授权失败时是否向飞书发送诊断日志（IM 文件回复/单聊文件/文本通知）。本地 diagnostics 写入不受影响。 */
 const AUTH_FAILURE_DIAGNOSTIC_SEND_ENABLED = false;
@@ -304,13 +305,214 @@ function getOpenClawHomeDir() {
   return candidates.length ? expandHome(candidates[0]) : null;
 }
 
+export function getOpenClawManagedSkillsRoot() {
+  const openclawHome = getOpenClawHomeDir();
+  return openclawHome ? resolve(join(openclawHome, "skills")) : null;
+}
+
+export function inferOpenClawHomeFromSkillPath(skillPath) {
+  if (!skillPath) return null;
+  const normalized = String(skillPath).replace(/\\/g, "/");
+  const marker = "/.openclaw/";
+  const idx = normalized.toLowerCase().indexOf(marker);
+  if (idx === -1) return null;
+  return resolve(normalized.slice(0, idx + "/.openclaw".length));
+}
+
+export function listOpenClawBundledSkillRoots(options = {}) {
+  const homes = [];
+  const explicit = options.openclawHome === undefined ? getOpenClawHomeDir() : options.openclawHome;
+  if (explicit) homes.push(explicit);
+  const inferred = inferOpenClawHomeFromSkillPath(options.skillPath);
+  if (inferred) homes.push(inferred);
+
+  const roots = [];
+  const seenHomes = new Set();
+  for (const home of homes) {
+    const resolvedHome = resolve(home);
+    if (seenHomes.has(resolvedHome)) continue;
+    seenHomes.add(resolvedHome);
+    roots.push(join(resolvedHome, "skills"));
+    roots.push(join(resolvedHome, "workspace", "skills"));
+    const workspace = join(resolvedHome, "workspace");
+    if (!existsSync(workspace)) continue;
+    let entries = [];
+    try {
+      entries = readdirSync(workspace, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      roots.push(join(workspace, entry.name, "skills"));
+    }
+  }
+  return [...new Set(roots.map((root) => resolve(root)))];
+}
+
 export function getDefaultSkillRoots(ctx) {
   const ws = resolveWorkspaceDir(ctx);
   const roots = [join(homedir(), ".agents", "skills")];
   if (ws) roots.push(join(ws, "skills"));
   const openclawHome = getOpenClawHomeDir();
-  if (openclawHome) roots.push(join(openclawHome, "workspace", "skills"));
+  if (openclawHome) {
+    roots.push(join(openclawHome, "skills"));
+    roots.push(join(openclawHome, "workspace", "skills"));
+  }
   return [...new Set(roots.map((root) => resolve(expandHome(root))))];
+}
+
+function grantsDeclaredByAuth(auth, scope) {
+  const multi = auth?.scopeInstallGrants?.[scope];
+  if (Array.isArray(multi) && multi.length) {
+    return multi.filter((grant) => grant === "app" || grant === "user");
+  }
+  const single = auth?.scopeInstallGrant?.[scope];
+  if (single === "app" || single === "user") return [single];
+  return [];
+}
+
+export function mergeLarkAuthDeclarations(declarations) {
+  const usable = (declarations || []).filter((auth) => auth && Array.isArray(auth.scopes) && auth.scopes.length);
+  if (!usable.length) return null;
+
+  const scopeSet = new Set();
+  const grantSets = new Map();
+  let identity = "app";
+  for (const auth of usable) {
+    if (normalizeAuthIdentity(auth.identity) === "user") identity = "user";
+    for (const scope of auth.scopes) {
+      const normalized = String(scope || "").trim();
+      if (!normalized || isUserOpenIdScope(normalized)) continue;
+      scopeSet.add(normalized);
+      const bucket = grantSets.get(normalized) || new Set();
+      const declared = grantsDeclaredByAuth(auth, normalized);
+      if (!declared.length) bucket.add("unknown");
+      for (const grant of declared) bucket.add(grant);
+      grantSets.set(normalized, bucket);
+    }
+  }
+
+  const scopes = [...scopeSet].sort();
+  const scopeInstallGrant = {};
+  const scopeInstallGrants = {};
+  for (const scope of scopes) {
+    const grants = grantSets.get(scope) || new Set();
+    const explicit = [...grants].filter((grant) => grant === "app" || grant === "user").sort();
+    if (grants.has("unknown") || explicit.length !== 1) {
+      if (explicit.length > 1) scopeInstallGrants[scope] = explicit;
+      continue;
+    }
+    scopeInstallGrant[scope] = explicit[0];
+  }
+
+  const merged = {
+    identity,
+    scopes,
+    scopeInstallGrant,
+  };
+  if (Object.keys(scopeInstallGrants).length) merged.scopeInstallGrants = scopeInstallGrants;
+  return merged;
+}
+
+export function collectLarkAuthFromSkillRoots(roots) {
+  const declarations = [];
+  const seen = new Set();
+  for (const root of roots || []) {
+    if (!root || !existsSync(root)) continue;
+    for (const skillPath of buildSkillMap([root]).keys()) {
+      const key = resolve(skillPath);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const auth = readLarkAuth(skillPath);
+      if (auth?.scopes?.length) declarations.push(auth);
+    }
+  }
+  const auth = mergeLarkAuthDeclarations(declarations);
+  if (!auth) return null;
+  return {
+    ...auth,
+    skillCount: declarations.length,
+  };
+}
+
+export function collectLarkAuthFromSkillRoot(root) {
+  return collectLarkAuthFromSkillRoots(root ? [root] : []);
+}
+
+export function expandLarkAuthWithManagedSkills(currentAuth, options = {}) {
+  const roots = Array.isArray(options.roots)
+    ? options.roots
+    : options.root !== undefined
+      ? [options.root]
+      : listOpenClawBundledSkillRoots({
+        openclawHome: options.openclawHome,
+        skillPath: options.skillPath,
+      });
+  const managed = options.managedAuth !== undefined
+    ? options.managedAuth
+    : collectLarkAuthFromSkillRoots(roots);
+  const managedRoot = roots.map((root) => resolve(String(root || ""))).join(" | ");
+  if (!managed?.scopes?.length) {
+    return {
+      auth: currentAuth,
+      managedRoot,
+      bundled: false,
+      skillCount: 0,
+    };
+  }
+  return {
+    auth: mergeLarkAuthDeclarations([currentAuth, managed]),
+    managedRoot,
+    bundled: true,
+    skillCount: Number(managed.skillCount || 0),
+  };
+}
+
+function skillNameFromCandidate(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/\\/g, "/");
+  const leaf = basename(normalized);
+  if (leaf.toLowerCase() === "skill.md") {
+    const parent = basename(dirname(normalized));
+    return parent && parent !== "." ? parent : "";
+  }
+  if (normalized.includes("/")) return leaf;
+  return raw;
+}
+
+function iterateSkillNameCandidates(skillNames) {
+  if (skillNames == null) return [];
+  const source = skillNames instanceof Map ? skillNames.values() : skillNames;
+  if (typeof source === "string") return [source];
+  if (typeof source?.[Symbol.iterator] === "function") return [...source];
+  return [];
+}
+
+export function selectExplicitSkillNames(userText, skillNames) {
+  const text = String(userText || "");
+  if (!text.trim()) return [];
+  const names = [...new Set(
+    iterateSkillNameCandidates(skillNames)
+      .map(skillNameFromCandidate)
+      .filter(Boolean),
+  )].sort((left, right) => right.length - left.length);
+  const matched = [];
+  for (const skillName of names) {
+    const escaped = skillName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, "u");
+    if (pattern.test(text)) matched.push(skillName);
+  }
+  return matched;
+}
+
+export function isUserGrantWaiterDenial(waiter) {
+  if (!waiter) return false;
+  if (waiter.denied === true) return true;
+  const output = String(waiter.output || "");
+  if (/access_denied|authorization_denied|expired_token|oauth_denied/iu.test(output)) return true;
+  return waiter.exited === true && waiter.exitCode != null && Number(waiter.exitCode) !== 0;
 }
 
 export function resolveSkillReadTarget(rawPath, cwd, wsDir) {
@@ -811,8 +1013,10 @@ async function bindOpenClawProfile(profile, appId) {
   return { ok: false, error: summarizeCommandResult(forced) };
 }
 
-export async function ensureLarkCliBindingReady(ctx = {}) {
-  const health = await checkLarkCliRuntimeReady();
+export async function ensureLarkCliBindingReady(ctx = {}, options = {}) {
+  const hasExplicitProfile = Object.prototype.hasOwnProperty.call(options, "profile");
+  const explicitProfile = hasExplicitProfile ? String(options.profile || "").trim() || null : null;
+  const health = await checkLarkCliRuntimeReady(explicitProfile);
   if (!health.ok) {
     return { ok: false, state: "blocked", reason: health.error, precondition: "lark-cli" };
   }
@@ -822,8 +1026,10 @@ export async function ensureLarkCliBindingReady(ctx = {}) {
     return { ok: false, state: "blocked", reason: "OpenClaw Feishu appId unavailable", precondition: "openclaw-app-id" };
   }
 
-  const configuredProfile = getConfiguredLarkCliProfile();
-  const profileResolution = configuredProfile
+  const configuredProfile = hasExplicitProfile ? explicitProfile : getConfiguredLarkCliProfile();
+  const profileResolution = hasExplicitProfile
+    ? { resolved: true, profile: explicitProfile, source: "explicit" }
+    : configuredProfile
     ? { resolved: true, profile: configuredProfile, source: "env" }
     : await resolveLarkCliProfile(ctx);
   if (!profileResolution?.resolved) {
@@ -867,14 +1073,31 @@ function spawnLarkCliDeviceWait(deviceCode, profile = undefined) {
   try {
     const child = spawn("lark-cli", fullArgs, {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    const waiter = { started: true, pid: child.pid || null, exited: false, exitCode: null, signal: null };
+    const waiter = {
+      started: true,
+      pid: child.pid || null,
+      exited: false,
+      exitCode: null,
+      signal: null,
+      output: "",
+      denied: false,
+    };
+    const appendOutput = (chunk) => {
+      waiter.output = `${waiter.output}${chunk || ""}`.slice(-4000);
+      if (/access_denied|authorization_denied|expired_token|oauth_denied/iu.test(waiter.output)) {
+        waiter.denied = true;
+      }
+    };
+    child.stdout?.on("data", appendOutput);
+    child.stderr?.on("data", appendOutput);
     child.once("exit", (code, signal) => {
       waiter.exited = true;
       waiter.exitCode = code;
       waiter.signal = signal;
+      if (isUserGrantWaiterDenial(waiter)) waiter.denied = true;
     });
     child.unref();
     waiter.cancel = () => {
@@ -893,8 +1116,12 @@ function spawnLarkCliDeviceWait(deviceCode, profile = undefined) {
   }
 }
 
-async function startUserGrantLogin(scopes, ctx = {}) {
-  const binding = await ensureLarkCliBindingReady(ctx);
+async function startUserGrantLogin(scopes, ctx = {}, options = {}) {
+  const binding = await ensureLarkCliBindingReady(ctx, {
+    ...(Object.prototype.hasOwnProperty.call(options, "larkProfile")
+      ? { profile: options.larkProfile }
+      : {}),
+  });
   if (!binding.ok) {
     return {
       error: binding.reason || "lark-cli binding unavailable",
@@ -930,6 +1157,7 @@ async function startUserGrantLogin(scopes, ctx = {}) {
     expiresIn: Number(payload?.expires_in || payload?.expiresIn || 600) || 600,
     interval: Number(payload?.interval || 5) || 5,
     provider: "lark-cli",
+    larkProfile: binding.profile,
     authWaiter: waiter?.error ? null : waiter,
   };
 }
@@ -948,6 +1176,24 @@ function normalizeScopeIdentity(value) {
   if (raw.includes("user") || raw.includes("用户")) return "user";
   if (raw.includes("app") || raw.includes("tenant") || raw.includes("bot") || raw.includes("应用")) return "app";
   return null;
+}
+
+export function retainGrantedTenantScopes(catalogEntries, grantScopes) {
+  const grantedNames = new Set();
+  for (const item of Array.isArray(grantScopes) ? grantScopes : []) {
+    if (!item || typeof item !== "object") continue;
+    const name = String(item.scope_name || item.scope || "").trim();
+    if (!name || Number(item.grant_status ?? item.grantStatus) !== 1) continue;
+    grantedNames.add(name);
+  }
+  const retained = (Array.isArray(catalogEntries) ? catalogEntries : []).filter((entry) =>
+    grantedNames.has(String(entry?.scope || "").trim()),
+  );
+  const known = new Set(retained.map((entry) => entry.scope));
+  for (const name of grantedNames) {
+    if (!known.has(name)) retained.push({ scope: name, identity: null, raw: null });
+  }
+  return retained;
 }
 
 export function normalizeAppScopeEntries(scopesArr) {
@@ -1032,7 +1278,12 @@ function appScopeEntriesMatchingScope(scope, appScopeEntries) {
   });
 }
 
-function bucketsFromScopeInstallGrant(scope, scopeInstallGrant) {
+function bucketsFromScopeInstallGrant(scope, scopeInstallGrant, scopeInstallGrants = null) {
+  const multi = scopeInstallGrants?.[scope];
+  if (Array.isArray(multi) && multi.length) {
+    const buckets = [...new Set(multi.filter((grant) => grant === "app" || grant === "user"))];
+    if (buckets.length) return buckets;
+  }
   if (!scopeInstallGrant || typeof scopeInstallGrant !== "object") return null;
   const direct = scopeInstallGrant[scope];
   if (direct === "app" || direct === "user") return [direct];
@@ -1054,7 +1305,11 @@ export function resolveScopeAppInstallBuckets(scope, appScopeEntries, options = 
   const skillIdentity = normalizeAuthIdentity(options.identity || "user");
   if (!requested) return ["any"];
 
-  const grantBuckets = bucketsFromScopeInstallGrant(requested, options.scopeInstallGrant);
+  const grantBuckets = bucketsFromScopeInstallGrant(
+    requested,
+    options.scopeInstallGrant,
+    options.scopeInstallGrants,
+  );
   if (grantBuckets) return grantBuckets;
 
   if (!Array.isArray(appScopeEntries) || !hasIdentityMetadata(appScopeEntries)) {
@@ -1094,6 +1349,7 @@ export function isScopeGrantedOnAppInstall(scope, appScopeEntries, options = {})
   const buckets = resolveScopeAppInstallBuckets(scope, appScopeEntries, {
     identity,
     scopeInstallGrant: options.scopeInstallGrant,
+    scopeInstallGrants: options.scopeInstallGrants,
   });
   if (buckets.length === 1 && buckets[0] === "any") {
     const mergedList = appScopeEntries.map((entry) => entry.scope).filter(Boolean);
@@ -1110,12 +1366,14 @@ export function isScopeGrantedOnAppInstall(scope, appScopeEntries, options = {})
 
 export function filterScopesNeedingUserGrant(scopes, appScopeEntries, options = {}) {
   const scopeInstallGrant = options.scopeInstallGrant || null;
+  const scopeInstallGrants = options.scopeInstallGrants || null;
   const list = uniqueScopes(scopes);
   if (!list.length) return [];
   return list.filter((scope) => {
     if (isAppInstallOnlyScopeName(scope)) return false;
-    const grantBuckets = bucketsFromScopeInstallGrant(scope, scopeInstallGrant);
+    const grantBuckets = bucketsFromScopeInstallGrant(scope, scopeInstallGrant, scopeInstallGrants);
     if (grantBuckets?.length === 1 && grantBuckets[0] === "app") return false;
+    if (grantBuckets?.includes("user")) return true;
     if (!Array.isArray(appScopeEntries) || !hasIdentityMetadata(appScopeEntries)) return true;
     const exactMatches = appScopeEntries.filter((entry) => entry.scope === scope);
     if (!exactMatches.length) return true;
@@ -1125,12 +1383,13 @@ export function filterScopesNeedingUserGrant(scopes, appScopeEntries, options = 
 
 function filterScopesNeedingTenantGrant(missing, appScopeEntries, options = {}) {
   const scopeInstallGrant = options.scopeInstallGrant || null;
+  const scopeInstallGrants = options.scopeInstallGrants || null;
   const list = uniqueScopes(missing);
   if (!list.length) return [];
   return list.filter((scope) => {
-    const grantBuckets = bucketsFromScopeInstallGrant(scope, scopeInstallGrant);
+    const grantBuckets = bucketsFromScopeInstallGrant(scope, scopeInstallGrant, scopeInstallGrants);
+    if (grantBuckets?.includes("app")) return true;
     if (grantBuckets?.length === 1 && grantBuckets[0] === "user") return false;
-    if (grantBuckets?.length === 1 && grantBuckets[0] === "app") return true;
     if (!Array.isArray(appScopeEntries) || !hasIdentityMetadata(appScopeEntries)) {
       return true;
     }
@@ -1374,6 +1633,86 @@ export function selectAuthedUserProfile(profiles, options = {}) {
   return normalized.find((entry) => entry.openId) || null;
 }
 
+export async function resolveInstallAuthRecipient(ctx = {}, options = {}) {
+  const accountId = getAccountId(ctx) || ctx?.accountId || ctx?.account || null;
+  const appId = await getAppId(ctx).catch(() => null);
+  if (!appId) {
+    return { ok: false, reasonCode: "app_unresolved" };
+  }
+
+  const health = await checkLarkCliRuntimeReady();
+  if (!health.ok) {
+    return { ok: false, reasonCode: "runtime_unavailable", detail: health.error };
+  }
+
+  const listed = await runLarkCli(["profile", "list"], { timeoutMs: 10000, profile: null });
+  const profiles = extractJsonArray(listed.stdout, listed.stderr);
+  if (!listed?.ok || !Array.isArray(profiles)) {
+    return { ok: false, reasonCode: "profile_list_unavailable" };
+  }
+
+  const requestedProfile = String(options.profile || "").trim() || null;
+  const candidates = profiles
+    .filter((profile) => getStatusString(profile?.appId || profile?.app_id) === getStatusString(appId))
+    .map((profile) => String(profile?.name || "").trim())
+    .filter(Boolean)
+    .filter((profile) => !requestedProfile || profile === requestedProfile);
+  if (requestedProfile && candidates.length === 0) {
+    return { ok: false, reasonCode: "profile_unresolved" };
+  }
+  if (candidates.length === 0) {
+    return { ok: false, reasonCode: "recipient_unavailable" };
+  }
+
+  const verified = [];
+  const verifiedOtherUsers = [];
+  const explicitOpenId = String(options.openId || "").trim() || null;
+  for (const profile of candidates) {
+    const result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
+    const payload = extractJsonPayload(result.stdout, result.stderr);
+    const user = payload?.identities?.user;
+    const statusAppId = getStatusString(payload?.appId || payload?.app_id);
+    const openId = getStatusString(user?.openId || user?.open_id);
+    if (!result?.ok || statusAppId !== getStatusString(appId)) continue;
+    if (user?.available !== true || user?.verified !== true || !openId) continue;
+    const tuple = { profile, openId };
+    if (!explicitOpenId || openId === explicitOpenId) verified.push(tuple);
+    else verifiedOtherUsers.push(tuple);
+  }
+
+  if (verified.length === 1) {
+    return {
+      ok: true,
+      accountId,
+      appId,
+      profile: verified[0].profile,
+      openId: verified[0].openId,
+      source: explicitOpenId ? "explicit-config" : "verified-profile",
+    };
+  }
+  if (verified.length > 1) {
+    return { ok: false, reasonCode: "recipient_ambiguous" };
+  }
+  if (explicitOpenId && verifiedOtherUsers.length > 0) {
+    return { ok: false, reasonCode: "identity_mismatch" };
+  }
+  if (explicitOpenId && candidates.length === 1) {
+    return {
+      ok: true,
+      accountId,
+      appId,
+      profile: candidates[0],
+      openId: explicitOpenId,
+      source: "explicit-config",
+      bootstrap: true,
+    };
+  }
+  return {
+    ok: false,
+    reasonCode: candidates.length > 1 ? "recipient_ambiguous" : "recipient_unavailable",
+  };
+}
+
 export function getSkillAuthCacheKey(skillPath, ctx) {
   return `${getAccountId(ctx) || "unknown"}::${resolve(skillPath)}`;
 }
@@ -1513,23 +1852,39 @@ export async function getAppScopeEntries(ctx, options = {}) {
     return cached.promise;
   }
 
-  const combinedPromise = callFeishuOpenApi(credentials, {
-    method: "GET",
-    path: `/open-apis/application/v6/applications/${aid}`,
-    params: { lang: "zh_cn" },
-  })
-    .then((response) => {
-      if (!response || response.code !== 0) {
+  const combinedPromise = Promise.all([
+    callFeishuOpenApi(credentials, {
+      method: "GET",
+      path: `/open-apis/application/v6/applications/${aid}`,
+      params: { lang: "zh_cn" },
+    }),
+    callFeishuOpenApi(credentials, {
+      method: "GET",
+      path: "/open-apis/application/v6/scopes",
+    }),
+  ])
+    .then(([appResponse, grantResponse]) => {
+      if (!grantResponse || grantResponse.code !== 0 || !Array.isArray(grantResponse?.data?.scopes)) {
         fileLog(
-          `getAppScopes: API failed: ${response?.msg || response?.message || "unparseable"}`,
+          `getAppScopes: tenant grant status failed: ${grantResponse?.msg || grantResponse?.message || "unparseable"}`,
         );
         return null;
       }
-      const scopesArr = response?.data?.app?.scopes;
-      if (!Array.isArray(scopesArr)) {
-        return null;
+      const catalog = appResponse?.code === 0 && Array.isArray(appResponse?.data?.app?.scopes)
+        ? normalizeAppScopeEntries(appResponse.data.app.scopes)
+        : [];
+      if (appResponse?.code !== 0) {
+        fileLog(
+          `getAppScopes: application catalog failed, using granted scope names only: ${appResponse?.msg || appResponse?.message || "unparseable"}`,
+        );
       }
-      const entries = normalizeAppScopeEntries(scopesArr);
+      const entries = retainGrantedTenantScopes(catalog, grantResponse.data.scopes);
+      const revoked = grantResponse.data.scopes
+        .map((item) => String(item?.scope_name || item?.scope || "").trim())
+        .filter((name) => name && !entries.some((entry) => entry.scope === name));
+      fileLog(
+        `getAppScopes: tenant grants granted=${entries.length} revoked=${revoked.length}${revoked.length ? ` revokedScopes=${JSON.stringify(revoked)}` : ""}`,
+      );
       appScopesCache.set(aid, {
         entries,
         expiresAt: Date.now() + APP_SCOPES_CACHE_TTL_MS,
@@ -1572,8 +1927,9 @@ export async function checkScopes(scopes, ctx, options = {}) {
   const bucketHints = [];
 
   const scopeInstallGrant = options.scopeInstallGrant || null;
+  const scopeInstallGrants = options.scopeInstallGrants || null;
   for (const scope of scopes) {
-    const checkOptions = { identity, scopeInstallGrant };
+    const checkOptions = { identity, scopeInstallGrant, scopeInstallGrants };
     const buckets = identityAware
       ? resolveScopeAppInstallBuckets(scope, appScopeEntries, checkOptions)
       : ["any"];
@@ -1610,22 +1966,65 @@ export function buildScopeGrantLoginPayload(missing, options = {}) {
   if (identity === "user") {
     const requiredScopes = uniqueScopes(options.requiredScopes || missing);
     const scopeInstallGrant = options.scopeInstallGrant || null;
+    const scopeInstallGrants = options.scopeInstallGrants || null;
     const appScopeEntries = options.appScopeEntries;
+    const grantOptions = { scopeInstallGrant, scopeInstallGrants };
     const tenantMissing = filterScopesNeedingTenantGrant(
       uniqueScopes(missing),
       appScopeEntries,
-      { scopeInstallGrant },
+      grantOptions,
     );
     const userScopesForGrant = filterScopesNeedingUserGrant(
       requiredScopes,
       appScopeEntries,
-      { scopeInstallGrant },
+      grantOptions,
     );
     payload.tenantScopes = tenantMissing.length ? tenantMissing : null;
     payload.userScopes = userScopesForGrant.length ? userScopesForGrant : null;
     payload.scopeGrantDual = Boolean(payload.tenantScopes?.length && payload.userScopes?.length);
   }
   return payload;
+}
+
+export function listSubmittedGrantScopes(missing, options = {}) {
+  const authReason = String(options.authReason || "app_scope").trim();
+  const identity = normalizeAuthIdentity(options.identity);
+  const grantOptions = {
+    scopeInstallGrant: options.scopeInstallGrant || null,
+    scopeInstallGrants: options.scopeInstallGrants || null,
+  };
+  if (authReason === "user_grant") {
+    const userScopes = filterScopesNeedingUserGrant(
+      uniqueScopes(options.requiredScopes || missing),
+      options.appScopeEntries,
+      grantOptions,
+    );
+    return {
+      tenantScopes: [],
+      userScopes,
+      requestedScopes: userScopes,
+      scopeGrantDual: false,
+    };
+  }
+  if (identity === "user") {
+    const grant = buildScopeGrantLoginPayload(missing, options);
+    const tenantScopes = grant.tenantScopes || [];
+    const userScopes = grant.userScopes || [];
+    const requestedScopes = uniqueScopes([...tenantScopes, ...userScopes]);
+    return {
+      tenantScopes,
+      userScopes,
+      requestedScopes: requestedScopes.length ? requestedScopes : uniqueScopes(missing),
+      scopeGrantDual: grant.scopeGrantDual === true,
+    };
+  }
+  const requestedScopes = uniqueScopes(missing);
+  return {
+    tenantScopes: requestedScopes,
+    userScopes: [],
+    requestedScopes,
+    scopeGrantDual: false,
+  };
 }
 
 function uniqueScopes(list) {
@@ -1638,15 +2037,17 @@ export async function startLogin(missing, ctx, options = {}) {
   try {
     const appScopeEntries =
       options.appScopeEntries ?? (await getAppScopeEntries(ctx).catch(() => null));
+    const submitted = listSubmittedGrantScopes(missing, { ...options, appScopeEntries });
     const grant = buildScopeGrantLoginPayload(missing, { ...options, appScopeEntries });
     if (grant.authReason === "user_grant") {
-      const loginScopes = filterScopesNeedingUserGrant(
-        uniqueScopes(options.requiredScopes || missing),
-        appScopeEntries,
-        { scopeInstallGrant: options.scopeInstallGrant },
-      );
-      if (!loginScopes.length) return { error: "no scopes" };
-      return await startUserGrantLogin(loginScopes, ctx);
+      if (!submitted.requestedScopes.length) return { error: "no scopes" };
+      const login = await startUserGrantLogin(submitted.requestedScopes, ctx, options);
+      if (!login?.verificationUrl) return login;
+      return {
+        ...login,
+        requestedScopes: submitted.requestedScopes,
+        scopeGrantDual: false,
+      };
     }
     const credentials = await getAccountCredentials(ctx);
     const flow = await beginScopeGrantFlow({
@@ -1657,6 +2058,7 @@ export async function startLogin(missing, ctx, options = {}) {
       tenantScopes: grant.tenantScopes,
       userScopes: grant.userScopes,
       scopeInstallGrant: options.scopeInstallGrant || null,
+      scopeInstallGrants: options.scopeInstallGrants || null,
     });
     if (grant.scopeGrantDual) {
       fileLog(
@@ -1666,6 +2068,7 @@ export async function startLogin(missing, ctx, options = {}) {
     return {
       ...flow,
       scopeGrantDual: grant.scopeGrantDual,
+      requestedScopes: submitted.requestedScopes,
     };
   } catch (error) {
     fileLog(`startLogin: request failed: ${formatError(error)}`);
@@ -1792,18 +2195,22 @@ async function checkUserGrantViaLarkCli(openId, scopes, ctx = {}, options = {}) 
   if (!expectedAppId) {
     expectedAppId = recallResolvedCredentials(ctx)?.appId || null;
   }
-  const configuredProfile = getConfiguredLarkCliProfile();
-  const cachedProfile = !configuredProfile && expectedAppId ? larkCliProfileByAppId.get(expectedAppId) : null;
+  const hasExplicitProfile = Object.prototype.hasOwnProperty.call(options, "larkProfile");
+  const explicitProfile = hasExplicitProfile ? String(options.larkProfile || "").trim() || null : null;
+  const configuredProfile = hasExplicitProfile ? explicitProfile : getConfiguredLarkCliProfile();
+  const cachedProfile = !hasExplicitProfile && !configuredProfile && expectedAppId
+    ? larkCliProfileByAppId.get(expectedAppId)
+    : null;
   let profile = configuredProfile || cachedProfile?.profile || null;
   let result = await runLarkCli(["auth", "status", "--verify"], { timeoutMs: 30000, profile });
   let payload = extractJsonPayload(result.stdout, result.stderr);
   let userIdentity = payload?.identities?.user;
-  const defaultProfileMatchesApp = !configuredProfile &&
+  const defaultProfileMatchesApp = !hasExplicitProfile && !configuredProfile &&
     getStatusString(payload?.appId || payload?.app_id) === getStatusString(expectedAppId);
   if (defaultProfileMatchesApp && expectedAppId) {
     larkCliProfileByAppId.set(expectedAppId, { profile: null, resolvedAtMs: Date.now() });
   }
-  if (!configuredProfile && !profile && !defaultProfileMatchesApp) {
+  if (!hasExplicitProfile && !configuredProfile && !profile && !defaultProfileMatchesApp) {
     const profileResolution = await resolveLarkCliProfile(ctx);
     if (!profileResolution.resolved) {
       const failed = {
@@ -2433,24 +2840,33 @@ function buildAuthStageFailureCard({
   cardHint = null,
 }) {
   const timedOut = state === "timeout";
+  const denied = state === "denied";
   const runtimeUnavailable = state === "oauth_runtime_unavailable";
   const appScope = authReason === "app_scope";
   const subject = appScope ? "飞书应用权限开通" : "飞书用户授权";
-  const title = runtimeUnavailable
+  const title = denied
+    ? `${subject}已拒绝`
+    : runtimeUnavailable
     ? "飞书用户授权运行时不可用"
     : timedOut ? `${subject}超时` : "飞书用户授权未完成";
-  const subtitle = runtimeUnavailable
+  const subtitle = denied
+    ? `技能 “${skillName}” 的${appScope ? "应用权限开通" : "用户授权"}已拒绝，技能已停止`
+    : runtimeUnavailable
     ? `技能 “${skillName}” 的用户授权运行时当前不可用`
     : timedOut
       ? `技能 “${skillName}” 的${appScope ? "应用权限开通" : "用户授权"}已超时`
       : `技能 “${skillName}” 的用户授权已取消或未完成`;
-  const fallbackContent = runtimeUnavailable
+  const fallbackContent = denied
+    ? "你已拒绝本次授权，技能已停止。如需继续，请重新触发该技能。"
+    : runtimeUnavailable
     ? "授权运行时当前不可用，请检查 OAuth 运行时后重试。"
     : timedOut
       ? `${appScope ? "应用权限开通" : "授权"}超时，请重新触发技能后再次授权。`
       : "授权被取消或未成功完成，请重新触发技能后再次授权。";
   const content = userSummary || fallbackContent;
-  const statusText = timedOut
+  const statusText = denied
+    ? "<font color='red'>✖ 授权已拒绝，技能已停止</font>"
+    : timedOut
     ? "<font color='orange'>⏱ 授权超时</font>"
     : runtimeUnavailable
       ? "<font color='red'>✖ 授权运行时不可用</font>"
@@ -2736,8 +3152,10 @@ export function startWaitForAuth({
   scopes,
   requiredScopes = null,
   scopeInstallGrant = null,
+  scopeInstallGrants = null,
   identity = "user",
   authReason = "app_scope",
+  larkProfile = null,
   ctx,
   authMessageId = null,
   authWaiter = null,
@@ -2926,7 +3344,7 @@ export function startWaitForAuth({
                   messageId: authMessageId,
                   skillName,
                   accountId: waitCtx?.accountId || waitCtx?.account,
-                  state: "cancelled",
+                  state: "denied",
                   authReason,
                   authTargetKey,
                   waitCtx,
@@ -2937,7 +3355,7 @@ export function startWaitForAuth({
                   elapsedSec: Math.round(elapsed / 1000),
                 });
               }
-              cleanup({ reason: "cancelled" });
+              cleanup({ reason: "denied" });
               return;
             }
           }
@@ -2955,12 +3373,15 @@ export function startWaitForAuth({
       const userRequiredScopes = filterScopesNeedingUserGrant(
         Array.isArray(requiredScopes) && requiredScopes.length ? requiredScopes : scopes,
         appScopeEntries,
-        { scopeInstallGrant },
+        { scopeInstallGrant, scopeInstallGrants },
       );
       let check;
       if (authReason === "user_grant") {
         check = await withAsyncTimeout(
-          checkUserGrant(openId, userRequiredScopes, waitCtx, { acceptEmptyMissing: true }),
+          checkUserGrant(openId, userRequiredScopes, waitCtx, {
+            acceptEmptyMissing: true,
+            larkProfile,
+          }),
           35000,
           `checkUserGrant(${skillName})`,
         ).catch((error) => {
@@ -2971,19 +3392,10 @@ export function startWaitForAuth({
         check = await checkScopes(scopes, waitCtx, {
           identity: normalizedIdentity,
           appScopeEntries,
+          scopeInstallGrant,
+          scopeInstallGrants,
         });
-        if (!check?.ok && registrationReady) {
-          fileLog(
-            `waitForAuth: "${skillName}" registration authorized; proceeding despite API missing=${JSON.stringify(check?.missing || [])}`,
-          );
-          check = {
-            ok: true,
-            missing: [],
-            granted: Array.isArray(scopes) ? scopes : [],
-            identity: normalizedIdentity,
-            viaRegistration: true,
-          };
-        } else if (!check?.ok) {
+        if (!check?.ok) {
           const sampleScopes = Array.isArray(appScopeEntries)
             ? appScopeEntries.slice(0, 8).map((item) => `${item.scope}:${item.identity || "?"}`).join(", ")
             : "<none>";
@@ -2997,6 +3409,30 @@ export function startWaitForAuth({
         const checkLog = formatGrantCheckForLog(check, { acceptEmptyMissing: true });
         fileLog(`waitForAuth: "${skillName}" user grant poll result ${checkLog}`);
         noteTimeline(`checkUserGrant ${checkLog}`);
+      }
+      if (authReason === "user_grant" && isUserGrantWaiterDenial(authWaiter)) {
+        fileLog(
+          `waitForAuth: "${skillName}" user grant denied exitCode=${authWaiter?.exitCode ?? "unknown"} output=${String(authWaiter?.output || "").slice(0, 240)}`,
+        );
+        noteTimeline("user grant denied");
+        if (authMessageId) {
+          await reportAuthStageFailure({
+            messageId: authMessageId,
+            skillName,
+            accountId: waitCtx?.accountId || waitCtx?.account,
+            state: "denied",
+            authReason,
+            authTargetKey,
+            waitCtx,
+            openId,
+            timeline,
+            check,
+            authWaiter,
+            elapsedSec: Math.round(elapsed / 1000),
+          });
+        }
+        cleanup({ reason: "denied" });
+        return;
       }
       if (authReason === "user_grant" && authWaiter?.exited && !check?.ok) {
         if (!entry.waiterExitedAtMs) {
@@ -3044,7 +3480,10 @@ export function startWaitForAuth({
         if (normalizedIdentity === "user" && authReason !== "user_grant") {
           invalidateAppScopesCache(waitCtx?.appId || waitCtx?.feishuAppId);
           const userGrantCheck = await withAsyncTimeout(
-            checkUserGrant(openId, userRequiredScopes, waitCtx, { requireScopeDetails: true }),
+            checkUserGrant(openId, userRequiredScopes, waitCtx, {
+              requireScopeDetails: true,
+              larkProfile,
+            }),
             35000,
             `checkUserGrantPrecheck(${skillName})`,
           ).catch((error) => {
@@ -3065,13 +3504,16 @@ export function startWaitForAuth({
               requiredScopes: userRequiredScopes,
               appScopeEntries,
               scopeInstallGrant,
+              scopeInstallGrants,
+              larkProfile,
               ...(oauthState ? { oauthState } : {}),
             });
             if (!isActive()) return;
             if (login?.verificationUrl) {
               const sent = await deliverAuthCard({
                 skillName,
-                missing: userGrantMissing,
+                missing: login.requestedScopes?.length ? login.requestedScopes : userGrantMissing,
+                requestedScopes: login.requestedScopes,
                 verificationUrl: login.verificationUrl,
                 userCode: login.userCode,
                 deviceCode: login.deviceCode,
@@ -3102,6 +3544,7 @@ export function startWaitForAuth({
                       authReason: "user_grant",
                       messageId: sent.messageId,
                       deviceCode: login.deviceCode,
+                      larkProfile: login.larkProfile || larkProfile,
                       ctx: waitCtx,
                     });
                     if (!isActive()) return;
@@ -3125,8 +3568,10 @@ export function startWaitForAuth({
                   scopes: userGrantMissing,
                   requiredScopes: userRequiredScopes,
                   scopeInstallGrant,
+                  scopeInstallGrants,
                   identity: "user",
                   authReason: "user_grant",
+                  larkProfile: login.larkProfile || larkProfile,
                   ctx: waitCtx,
                   authMessageId: sent.messageId,
                   authWaiter: login.authWaiter,
@@ -3220,28 +3665,34 @@ export function startWaitForAuth({
   poll();
 }
 
+function displayedGrantScopes({ missing, requestedScopes }) {
+  const submitted = uniqueScopes(requestedScopes);
+  if (submitted.length) return submitted;
+  return uniqueScopes(missing);
+}
+
 function buildAuthCardPayload({
   skillName,
   missing,
+  requestedScopes = null,
   verificationUrl,
   identity = "user",
   authReason = "app_scope",
   oauthState = null,
   scopeGrantDual = false,
-  userScopeCount = null,
   authStep = null,
   handoffFromAppScope = false,
   userGrantAlreadyComplete = false,
 }) {
   const authUrl = sidebarApplink(verificationUrl);
-  const scopeCount = missing.length;
-  const scopeLines = missing.map((s) => `• \`${s}\``).join("\n");
+  const scopes = displayedGrantScopes({ missing, requestedScopes });
+  const scopeCount = scopes.length;
+  const scopeLines = scopes.map((s) => `• \`${s}\``).join("\n");
   const normalizedIdentity = normalizeAuthIdentity(identity);
   const isUserGrant = authReason === "user_grant";
   const isDualScopeGrant = scopeGrantDual === true && !isUserGrant && !userGrantAlreadyComplete;
   const isReauthorization = oauthState === "oauth_reauth_required";
   const isScopeMissing = oauthState === "scope_missing";
-  const configuredUserScopeCount = Number.isFinite(userScopeCount) ? userScopeCount : scopeCount;
   const stepPrefix = authStep === 1 ? "（1/2）" : authStep === 2 ? "（2/2）" : "";
   const authTitle = handoffFromAppScope
     ? `飞书授权${stepPrefix} 请完成用户登录`
@@ -3266,7 +3717,7 @@ function buildAuthCardPayload({
     : isUserGrant
     ? `请完成用户登录授权，以访问 **${scopeCount}** 项飞书权限。`
     : isDualScopeGrant
-      ? `请在本页一次性确认 **${scopeCount}** 项应用权限与 **${configuredUserScopeCount}** 项用户身份权限；确认后 **本卡片会自动变为第 2 步登录**，无需再找新消息。`
+      ? `请在本页一次性确认 **${scopeCount}** 项权限（应用开通与用户身份授权在同一页完成）；确认后 **本卡片会自动变为第 2 步登录**，无需再找新消息。`
       : `技能需要应用先开通 **${scopeCount}** 项飞书${normalizedIdentity === "user" ? "用户身份" : "应用身份"}权限。`;
   const scopePanelTitle = isUserGrant || handoffFromAppScope ? "查看待授权权限" : "查看待开通权限";
   const buttonText = isUserGrant || handoffFromAppScope ? "🚀 继续 · 用户登录授权" : "🚀 前往开通权限";
@@ -3376,7 +3827,7 @@ async function deliverAuthCard({
   authReason = "app_scope",
   oauthState = null,
   scopeGrantDual = false,
-  userScopeCount = null,
+  requestedScopes = null,
   authStep = null,
   handoffFromAppScope = false,
   userGrantAlreadyComplete = false,
@@ -3390,12 +3841,12 @@ async function deliverAuthCard({
   const { card, authUrl } = buildAuthCardPayload({
     skillName,
     missing,
+    requestedScopes,
     verificationUrl,
     identity,
     authReason,
     oauthState,
     scopeGrantDual,
-    userScopeCount,
     authStep,
     handoffFromAppScope,
     userGrantAlreadyComplete,

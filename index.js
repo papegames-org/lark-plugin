@@ -1,4 +1,7 @@
+import { join } from "node:path";
+
 import { readLarkAuth } from "./parse-meta.js";
+import { collectSkillAuthManifest } from "./skill-auth-manifest.js";
 import {
   PENDING_AUTH_MAX_RETRIES,
   bumpPendingAuthNoticeFailure,
@@ -26,6 +29,7 @@ import {
   fileLog,
   getAppScopeEntries,
   getAuthPollingSnapshot,
+  expandLarkAuthWithManagedSkills,
   getAuthedUser,
   getAccountId,
   getCachedSenderId,
@@ -40,12 +44,14 @@ import {
   isAuthPollingActive,
   isAuthPollingActiveForTarget,
   resolveAuthCardRecipient,
+  resolveInstallAuthRecipient,
   ensureFeishuRuntimeHealth,
   finalizeAuthStageCard,
   PLUGIN_RUNTIME_BUILD,
   logCtxSnapshotOnce,
   resolvePath,
   resolveSkillReadTarget,
+  selectExplicitSkillNames,
   resolveWorkspaceDir,
   resetRuntimeCaches,
   sendAuthCard,
@@ -60,6 +66,7 @@ import {
 
 const baseDeps = {
   readLarkAuth,
+  collectSkillAuthManifest,
   PENDING_AUTH_MAX_RETRIES,
   bumpPendingAuthNoticeFailure,
   canRetryPendingAuthNotice,
@@ -79,6 +86,7 @@ const baseDeps = {
   fileLog,
   getAppScopeEntries,
   getAuthPollingSnapshot,
+  expandLarkAuthWithManagedSkills,
   getAuthedUser,
   getAccountId,
   getCachedSenderId,
@@ -93,12 +101,14 @@ const baseDeps = {
   isAuthPollingActive,
   isAuthPollingActiveForTarget,
   resolveAuthCardRecipient,
+  resolveInstallAuthRecipient,
   ensureFeishuRuntimeHealth,
   finalizeAuthStageCard,
   PLUGIN_RUNTIME_BUILD,
   logCtxSnapshotOnce,
   resolvePath,
   resolveSkillReadTarget,
+  selectExplicitSkillNames,
   resolveWorkspaceDir,
   resetRuntimeCaches,
   sendAuthCard,
@@ -114,6 +124,7 @@ export function createPluginEntry(overrides = {}) {
   const sharedPendingAuthRuntimeByStorePath = new Map();
   const {
     readLarkAuth,
+    collectSkillAuthManifest,
     PENDING_AUTH_MAX_RETRIES,
     bumpPendingAuthNoticeFailure,
     canRetryPendingAuthNotice,
@@ -135,6 +146,7 @@ export function createPluginEntry(overrides = {}) {
     getAuthedUser,
     getAccountId,
     getCachedSenderId,
+    expandLarkAuthWithManagedSkills,
     getDefaultSkillRoots,
     getSkillAuthCacheKey,
     normalizeAuthIdentity,
@@ -142,10 +154,12 @@ export function createPluginEntry(overrides = {}) {
     isAuthPollingActive,
     isAuthPollingActiveForTarget,
     resolveAuthCardRecipient,
+    resolveInstallAuthRecipient,
     ensureFeishuRuntimeHealth,
     logCtxSnapshotOnce,
     resolvePath,
     resolveSkillReadTarget,
+    selectExplicitSkillNames,
     resolveWorkspaceDir,
     resetRuntimeCaches,
     sendAuthCard,
@@ -155,6 +169,7 @@ export function createPluginEntry(overrides = {}) {
     startWaitForAuth,
     setPluginConfigRef,
   } = deps;
+  const installAuthRunKeys = new Set();
 
   function safeJson(value) {
     const seen = new WeakSet();
@@ -233,6 +248,8 @@ export function createPluginEntry(overrides = {}) {
     ].filter(Boolean))];
   }
 
+  const latestUserTextBySession = new Map();
+
   function readMessageText(value) {
     if (typeof value === "string") return value;
     if (Array.isArray(value)) return value.map(readMessageText).join(" ");
@@ -242,19 +259,53 @@ export function createPluginEntry(overrides = {}) {
     return "";
   }
 
-  // Only inspect actual user messages. OpenClaw's assembled prompt contains every
-  // installed Skill name, and event.messages may contain conversation history, so
-  // only the latest user message should trigger explicit skill preflight.
-  function findExplicitSkillNames(event, skillMap) {
+  function sessionTextKeys(event, ctx) {
+    return [...new Set([
+      ctx?.sessionId,
+      ctx?.sessionKey,
+      event?.sessionId,
+      event?.sessionKey,
+    ].filter((value) => typeof value === "string" && value.trim()))];
+  }
+
+  function readInboundUserText(event) {
     const messages = Array.isArray(event?.messages) ? event.messages : [];
     const latestUserMessage = [...messages]
       .reverse()
       .find((message) => String(message?.role || "").toLowerCase() === "user");
-    const userText = latestUserMessage
+    const fromMessages = latestUserMessage
       ? readMessageText(latestUserMessage?.content ?? latestUserMessage)
       : "";
+    if (fromMessages.trim()) return fromMessages.trim();
+    for (const value of [event?.body, event?.text, event?.content, event?.message, event?.rawBody]) {
+      const text = readMessageText(value);
+      if (text.trim() && text.trim().length <= 4000) return text.trim();
+    }
+    return "";
+  }
+
+  function rememberLatestUserText(event, ctx) {
+    const text = readInboundUserText(event);
+    if (!text) return;
+    for (const key of sessionTextKeys(event, ctx)) latestUserTextBySession.set(key, text);
+  }
+
+  // Only inspect actual user messages. OpenClaw's assembled prompt contains every
+  // installed Skill name, and event.messages may contain conversation history, so
+  // only the latest user message should trigger explicit skill preflight.
+  function findExplicitSkillNames(event, skillMap, ctx) {
+    let userText = readInboundUserText(event);
+    if (!userText) {
+      for (const key of sessionTextKeys(event, ctx)) {
+        const cached = latestUserTextBySession.get(key);
+        if (cached) {
+          userText = cached;
+          break;
+        }
+      }
+    }
     if (!userText) return [];
-    return [...new Set([...skillMap.values()].filter((skillName) => userText.includes(skillName)))];
+    return selectExplicitSkillNames(userText, skillMap);
   }
 
   // ---------- 主入口（直接导出 plain entry object，无需 definePluginEntry）----------
@@ -276,6 +327,7 @@ export function createPluginEntry(overrides = {}) {
     } else if (!apiConfigRef) {
       setApiConfigRef(incoming);
     }
+    const activeApiConfig = incomingHasAccounts ? incoming : apiConfigRef;
     // 插件私有配置在 api.pluginConfig（不是 api.config）
     const cfg = api.pluginConfig || {};
     setPluginConfigRef(cfg);
@@ -315,6 +367,99 @@ export function createPluginEntry(overrides = {}) {
         fileLog(banner);
       }
       return entry;
+    }
+
+    function normalizeInstallAuthConfig(ctx = null) {
+      const installAuth = cfg.installAuth && typeof cfg.installAuth === "object"
+        ? cfg.installAuth
+        : {};
+      if (installAuth.enabled === false) return null;
+      const explicitReceiveId = typeof installAuth.receiveId === "string" && installAuth.receiveId.trim()
+        ? installAuth.receiveId.trim()
+        : typeof installAuth.openId === "string" && installAuth.openId.trim()
+          ? installAuth.openId.trim()
+          : null;
+      const explicitReceiveIdType = typeof installAuth.receiveIdType === "string" && installAuth.receiveIdType.trim()
+        ? installAuth.receiveIdType.trim()
+        : "open_id";
+      const ctxRecipient = !explicitReceiveId && ctx ? resolveAuthCardRecipient(ctx) : null;
+      const receiveId = explicitReceiveId || (
+        ctxRecipient?.receiveIdType === "open_id" ? ctxRecipient.receiveId : null
+      );
+      const receiveIdType = explicitReceiveId ? explicitReceiveIdType : "open_id";
+      const openId = typeof installAuth.openId === "string" && installAuth.openId.trim()
+        ? installAuth.openId.trim()
+        : receiveIdType === "open_id"
+          ? receiveId
+          : null;
+      if (receiveId && receiveIdType !== "open_id") {
+        fileLog("installAuth skipped: automatic install authorization requires receiveIdType=open_id");
+        return null;
+      }
+      if (receiveId && openId && receiveId !== openId) {
+        fileLog("installAuth skipped: receiveId/openId conflict");
+        return null;
+      }
+      const profile = typeof installAuth.profile === "string" && installAuth.profile.trim()
+        ? installAuth.profile.trim()
+        : null;
+      return {
+        receiveId,
+        receiveIdType,
+        openId,
+        profile,
+        source: explicitReceiveId ? "config" : ctxRecipient?.receiveIdType === "open_id" ? "hook-sender" : "auto",
+      };
+    }
+
+    function getInstallAuthSkillRoots() {
+      const roots = Array.isArray(cfg.skillRoots) && cfg.skillRoots.length
+        ? cfg.skillRoots
+        : getDefaultSkillRoots(null);
+      const configAgents = Array.isArray(activeApiConfig?.agents?.list)
+        ? activeApiConfig.agents.list
+        : [];
+      const agentRoots = configAgents
+        .map((agent) => {
+          if (!agent?.workspace || !agent?.id) return null;
+          return {
+            root: join(String(agent.workspace), "skills"),
+            agentId: String(agent.id),
+          };
+        })
+        .filter(Boolean);
+      return [...roots, ...agentRoots];
+    }
+
+    function uniqueSortedScopes(values) {
+      return [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))].sort();
+    }
+
+    function buildManifestAppAuth(app) {
+      const appScopes = uniqueSortedScopes(app?.installScopes?.app);
+      const userScopes = uniqueSortedScopes(app?.installScopes?.user);
+      const unknownScopes = uniqueSortedScopes(app?.installScopes?.unknown);
+      const personalOAuthScopes = uniqueSortedScopes(app?.personalOAuthScopes);
+      const scopes = uniqueSortedScopes([...appScopes, ...userScopes, ...unknownScopes, ...personalOAuthScopes]);
+      if (!scopes.length) return null;
+
+      const scopeInstallGrant = {};
+      const scopeInstallGrants = {};
+      for (const scope of scopes) {
+        const grants = [];
+        if (appScopes.includes(scope)) grants.push("app");
+        if (userScopes.includes(scope)) grants.push("user");
+        if (grants.length === 1) scopeInstallGrant[scope] = grants[0];
+        if (grants.length > 1) scopeInstallGrants[scope] = grants;
+      }
+      const identity = userScopes.length || unknownScopes.length || personalOAuthScopes.length ? "user" : "app";
+      const auth = {
+        identity,
+        scopes,
+        scopeInstallGrant,
+      };
+      if (Object.keys(scopeInstallGrants).length) auth.scopeInstallGrants = scopeInstallGrants;
+      return auth;
     }
 
     const pendingAuthStorePath = getPendingAuthNoticeStorePath();
@@ -400,6 +545,7 @@ export function createPluginEntry(overrides = {}) {
         }
         return false;
       }
+      if (pendingGate.rejected === true) return false;
       const pollingActive = isAuthPollingActiveForTarget(pendingGate);
       const { waitUntilMs, waitRemainingMs } = describeAuthGateWait(pendingGate);
       const waitExpired = waitUntilMs === 0 || Date.now() > waitUntilMs;
@@ -430,7 +576,19 @@ export function createPluginEntry(overrides = {}) {
       }
     }
 
-    function blockForPendingAuthorization(skillName) {
+    function markAuthExecutionGateRejected(authTargetKey) {
+      for (const gate of pendingAuthExecutionGates.values()) {
+        if (gate.authTargetKey === authTargetKey) gate.rejected = true;
+      }
+    }
+
+    function blockForPendingAuthorization(skillName, pendingGate = null) {
+      if (pendingGate?.rejected) {
+        return {
+          block: true,
+          reason: `技能「${skillName}」的飞书授权已拒绝，当前会话中的技能已全部停止。如需继续，请重新触发该技能。`,
+        };
+      }
       return {
         block: true,
         reason: `技能「${skillName}」正在等待飞书授权完成，暂不执行后续操作。请完成授权后重试。`,
@@ -506,6 +664,7 @@ export function createPluginEntry(overrides = {}) {
         scopeInstallGrant: input.scopeInstallGrant,
         identity: input.identity,
         openId: input.openId,
+        larkProfile: input.larkProfile,
       });
     }
 
@@ -529,6 +688,7 @@ export function createPluginEntry(overrides = {}) {
           scopeInstallGrant: record.scopeInstallGrant || null,
           identity: record.identity || "user",
           authReason: record.authReason || "app_scope",
+          larkProfile: record.larkProfile || null,
           ctx: {
             accountId: record.accountId,
             account: record.accountId,
@@ -565,6 +725,7 @@ export function createPluginEntry(overrides = {}) {
       requiredScopes,
       identity,
       openId,
+      larkProfile,
     }) {
       if (!authTargetKey || !missingKey) return;
       const previous = skillAuthCache.get(authTargetKey);
@@ -591,6 +752,7 @@ export function createPluginEntry(overrides = {}) {
           requiredScopes,
           identity,
           openId,
+          larkProfile,
         });
       }
     }
@@ -667,6 +829,13 @@ export function createPluginEntry(overrides = {}) {
         onPollAttached: () => refreshAuthExecutionGateWait(authTargetKey),
         onCleanup: ({ reason } = {}) => {
           if (reason === "handoff") return;
+          if (reason === "denied") {
+            markAuthExecutionGateRejected(authTargetKey);
+            fileLog(
+              `waitForAuth onCleanup held rejected auth gate authTargetKey="${authTargetKey}" requesterKey=${requesterKey || "<none>"}`,
+            );
+            return;
+          }
           clearAuthExecutionGates(authTargetKey);
           fileLog(
             `waitForAuth onCleanup released auth gate authTargetKey="${authTargetKey}" reason=${reason || "unknown"} requesterKey=${requesterKey || "<none>"}`,
@@ -753,13 +922,22 @@ export function createPluginEntry(overrides = {}) {
         return { ok: false, notice: failedNotice, reason: "recipient unresolved" };
       }
 
-      const requiredScopes = notice.requiredScopes || notice.missing;
+      const larkAuthFromSkill = notice.skillPath ? readLarkAuth(notice.skillPath) : null;
+      const expandedAuth = expandLarkAuthWithManagedSkills(larkAuthFromSkill, {
+        skillPath: notice.skillPath,
+      });
+      const scopeInstallGrant = expandedAuth.auth?.scopeInstallGrant || larkAuthFromSkill?.scopeInstallGrant || null;
+      const scopeInstallGrants = expandedAuth.auth?.scopeInstallGrants || larkAuthFromSkill?.scopeInstallGrants || null;
+      const requiredScopes = expandedAuth.auth?.scopes?.length
+        ? expandedAuth.auth.scopes
+        : (notice.requiredScopes || notice.missing);
       let missing = notice.missing;
       let oauthState = notice.oauthState || null;
-      const larkAuthFromSkill = notice.skillPath ? readLarkAuth(notice.skillPath) : null;
-      const scopeInstallGrant = larkAuthFromSkill?.scopeInstallGrant || null;
       const appScopeEntries = await getAppScopeEntries({ accountId: notice.accountId }).catch(() => null);
-      const userGrantScopes = filterScopesNeedingUserGrant(requiredScopes, appScopeEntries, { scopeInstallGrant });
+      const userGrantScopes = filterScopesNeedingUserGrant(requiredScopes, appScopeEntries, {
+        scopeInstallGrant,
+        scopeInstallGrants,
+      });
       if (notice.authReason === "user_grant") {
         const grant = await checkUserGrant(
           notice.openId,
@@ -794,6 +972,7 @@ export function createPluginEntry(overrides = {}) {
         authReason: notice.authReason,
         requiredScopes,
         scopeInstallGrant,
+        scopeInstallGrants,
         ...(oauthState ? { oauthState } : {}),
       });
       if (!login?.verificationUrl) {
@@ -852,6 +1031,7 @@ export function createPluginEntry(overrides = {}) {
           scopes: missing,
           requiredScopes,
           scopeInstallGrant,
+          scopeInstallGrants,
           identity: notice.identity,
           authReason: notice.authReason,
           ...(oauthState ? { oauthState } : {}),
@@ -915,6 +1095,7 @@ export function createPluginEntry(overrides = {}) {
         fileLog(`accountId: cached from before_prompt_build sessionId=${ctx.sessionId} -> ${acc}`);
       }
       cacheTrustedSenderFromHook(event, ctx, "before_prompt_build");
+      rememberLatestUserText(event, ctx);
 
       // A Skill may already be described in the model prompt, in which case the
       // model can answer without reading SKILL.md or making a tool call.  Preflight
@@ -922,7 +1103,24 @@ export function createPluginEntry(overrides = {}) {
       // same guarded read path used for normal runtime execution.
       if (ctx?.messageProvider === "feishu" || ctx?.channel === "feishu") {
         const skillMapEntry = getSkillMapEntry(ctx);
-        const explicitSkillNames = findExplicitSkillNames(event, skillMapEntry.map);
+        const explicitSkillNames = findExplicitSkillNames(event, skillMapEntry.map, ctx);
+        const pendingGate = getAuthExecutionGate(event, ctx);
+        const resolvableSkillNames = explicitSkillNames.filter((skillName) =>
+          [...skillMapEntry.map.values()].some((candidateSkillName) => candidateSkillName === skillName),
+        );
+        const restartAfterReject = pendingGate?.rejected === true && resolvableSkillNames.length > 0;
+        if (pendingGate?.rejected && !restartAfterReject) {
+          fileLog(`before_prompt_build rejected gate blocks all skills pending="${pendingGate.skillName}"`);
+          if (blockRead) return blockForPendingAuthorization(pendingGate.skillName, pendingGate);
+        }
+        if (restartAfterReject) {
+          clearPendingAuthNotice(pendingGate.authTargetKey);
+          skillAuthCache.delete(pendingGate.authTargetKey);
+          clearAuthExecutionGates(pendingGate.authTargetKey);
+          fileLog(
+            `rejected gate cleared for explicit skill retry pending="${pendingGate.skillName}" skills=${resolvableSkillNames.join(",")}`,
+          );
+        }
         for (const skillName of explicitSkillNames) {
           const skillPath = [...skillMapEntry.map.entries()]
             .find(([, candidateSkillName]) => candidateSkillName === skillName)?.[0];
@@ -933,7 +1131,7 @@ export function createPluginEntry(overrides = {}) {
             params: { path: skillPath },
           }, {
             ...ctx,
-            authIntent: { type: "explicit_skill_retry", skillName },
+            authIntent: { type: "explicit_skill_retry", skillName, restartAfterReject },
             skillCommand: { skillName },
           });
           if (result?.block) return result;
@@ -953,6 +1151,13 @@ export function createPluginEntry(overrides = {}) {
         if (skey) cachedAccountBySession.set(skey, acc);
       }
       cacheTrustedSenderFromHook(event, { ...ctx, sessionId: sid || ctx?.sessionId, sessionKey: skey || ctx?.sessionKey }, "message_received");
+      rememberLatestUserText(event, { ...ctx, sessionId: sid || ctx?.sessionId, sessionKey: skey || ctx?.sessionKey });
+      const installAuthConfig = normalizeInstallAuthConfig({ ...ctx, sessionId: sid || ctx?.sessionId, sessionKey: skey || ctx?.sessionKey });
+      if (installAuthConfig?.source === "hook-sender") {
+        void runInstallAuthPreflight({ ...ctx, sessionId: sid || ctx?.sessionId, sessionKey: skey || ctx?.sessionKey }).catch((error) => {
+          fileLog(`installAuth message retry failed: ${error?.message || error}`);
+        });
+      }
     });
 
     async function guardToolCall(event, ctx) {
@@ -972,6 +1177,20 @@ export function createPluginEntry(overrides = {}) {
         if (pendingGate && releaseStaleAuthExecutionGate(pendingGate)) {
           pendingGate = getAuthExecutionGate(event, ctx);
         }
+        const explicitRetryName = ctx?.authIntent?.type === "explicit_skill_retry"
+          ? normalizeSkillName(ctx.authIntent.skillName)
+          : null;
+        if (pendingGate?.rejected && !explicitRetryName) {
+          fileLog(`auth gate rejected all skills tool=${event?.toolName || ""} pending="${pendingGate.skillName}"`);
+          return blockRead ? blockForPendingAuthorization(pendingGate.skillName, pendingGate) : undefined;
+        }
+        if (pendingGate?.rejected && explicitRetryName) {
+          clearPendingAuthNotice(pendingGate.authTargetKey);
+          skillAuthCache.delete(pendingGate.authTargetKey);
+          clearAuthExecutionGates(pendingGate.authTargetKey);
+          pendingGate = null;
+          fileLog(`auth gate rejected cleared by explicit retry skill="${explicitRetryName}"`);
+        }
         if (pendingGate && skillNameCandidates.includes(pendingGate.skillName) && !hasExplicitRetryIntent(ctx, pendingGate.skillName)) {
           const pollingActive = isAuthPollingActiveForTarget(pendingGate);
           const { waitRemainingMs } = describeAuthGateWait(pendingGate);
@@ -979,11 +1198,11 @@ export function createPluginEntry(overrides = {}) {
           fileLog(
             `auth gate held tool=${event?.toolName || ""} skill="${pendingGate.skillName}" pollingActive=${pollingActive} waitRemainingMs=${waitRemainingMs} lastPollAgeMs=${pollSnapshot?.lastPollAtMs ? Date.now() - pollSnapshot.lastPollAtMs : "<none>"}`,
           );
-          return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
+          return blockRead ? blockForPendingAuthorization(pendingGate.skillName, pendingGate) : undefined;
         }
         if (pendingGate && !skillNameCandidates.includes(pendingGate.skillName) && isProtectedPendingAuthOperation(event, pendingGate, directTarget, skillNameCandidates)) {
           fileLog(`auth gate blocked tool=${event?.toolName || ""} skill="${pendingGate.skillName}"`);
-          return blockRead ? blockForPendingAuthorization(pendingGate.skillName) : undefined;
+          return blockRead ? blockForPendingAuthorization(pendingGate.skillName, pendingGate) : undefined;
         }
         if (!isReadTool && skillNameCandidates.length === 0) return;
         if (isReadTool) {
@@ -1058,15 +1277,42 @@ export function createPluginEntry(overrides = {}) {
           fileLog(`debug: matched skillName="${skillName}" but could not resolve SKILL.md path`);
           return;
         }
-        const larkAuth = readLarkAuth(skillPath);
-        if (!larkAuth || !larkAuth.scopes.length) return;
+        const requestedSkillName = normalizeSkillName(ctx?.authIntent?.skillName)
+          || normalizeSkillName(ctx?.skillCommand?.skillName);
+        if (requestedSkillName) {
+          let requestedPath = null;
+          for (const [candidatePath, candidateSkillName] of skillMapEntry.map.entries()) {
+            if (candidateSkillName === requestedSkillName) {
+              requestedPath = candidatePath;
+              break;
+            }
+          }
+          if (requestedPath) {
+            if (skillName !== requestedSkillName) {
+              fileLog(`skill name aligned to explicit request "${requestedSkillName}" from "${skillName || "<none>"}"`);
+            }
+            skillName = requestedSkillName;
+            skillPath = requestedPath;
+          }
+        }
+        const declaredAuth = readLarkAuth(skillPath);
+        if (!declaredAuth || !declaredAuth.scopes.length) return;
+        const expandedAuth = expandLarkAuthWithManagedSkills(declaredAuth, { skillPath });
+        const larkAuth = expandedAuth.auth || declaredAuth;
+        if (expandedAuth.bundled) {
+          fileLog(
+            `larkAuth bundled managedRoot=${expandedAuth.managedRoot || "<none>"} skillCount=${expandedAuth.skillCount || 0} scopes=${larkAuth.scopes.join(",")}`,
+          );
+        }
         guardedSkillName = skillName;
         const identity = normalizeAuthIdentity(larkAuth.identity);
         let resolvedUser = identity === "user" ? await getAuthedUser(ctx).catch(() => null) : null;
         const requesterKey = identity === "user"
           ? (resolvedUser?.openId || getCachedSenderId(ctx) || getSessionGateKeys(event, ctx)[0] || null)
           : null;
-        const authTargetKey = getSkillAuthCacheKey(skillPath, ctx);
+        const authTargetKey = expandedAuth.bundled
+          ? `${getAccountId(ctx) || "unknown"}::openclaw-managed-skills`
+          : getSkillAuthCacheKey(skillPath, ctx);
 
         const runtime = await ensureFeishuRuntimeHealth(ctx);
         if (!runtime.ok) {
@@ -1078,10 +1324,12 @@ export function createPluginEntry(overrides = {}) {
           augmentCtxWithFeishuAccount(ctx, runtime.accountId);
         }
 
-        const appScopeEntries = await getAppScopeEntries(ctx).catch(() => null);
+        const appScopeEntries = await getAppScopeEntries(ctx, { forceRefresh: true }).catch(() => null);
         const appScopeCheck = await checkScopes(larkAuth.scopes, ctx, {
           identity,
+          appScopeEntries,
           scopeInstallGrant: larkAuth.scopeInstallGrant,
+          scopeInstallGrants: larkAuth.scopeInstallGrants,
         });
         let authReason = "app_scope";
         let missing = appScopeCheck.missing?.length ? appScopeCheck.missing : [];
@@ -1089,6 +1337,7 @@ export function createPluginEntry(overrides = {}) {
         let userGrantAlreadyComplete = false;
         const userGrantScopes = filterScopesNeedingUserGrant(larkAuth.scopes, appScopeEntries, {
           scopeInstallGrant: larkAuth.scopeInstallGrant,
+          scopeInstallGrants: larkAuth.scopeInstallGrants,
         });
 
         if (appScopeCheck.ok && identity === "app") {
@@ -1229,7 +1478,7 @@ export function createPluginEntry(overrides = {}) {
         if (cache) {
           fileLog(`debug: authTargetKey="${authTargetKey}" cache.missingKey="${cache.missingKey}" cur.missingKey="${missingKey}" age=${Math.round((now - cache.lastSentAtMs) / 1000)}s`);
         }
-        if (cache && cache.requesterKey === requesterKey && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
+        if (ctx?.authIntent?.restartAfterReject !== true && cache && cache.authorized !== true && cache.requesterKey === requesterKey && cache.missingKey === missingKey && (now - cache.lastSentAtMs) < 180000) {
           if (!cache.retryConsumed && hasExplicitRetryIntent(ctx, skillName)) {
             skillAuthCache.set(authTargetKey, { ...cache, retryConsumed: true });
             fileLog(`retry: authTargetKey="${authTargetKey}" explicit user retry allowed during cooldown`);
@@ -1247,6 +1496,7 @@ export function createPluginEntry(overrides = {}) {
           authReason,
           requiredScopes: larkAuth.scopes,
           scopeInstallGrant: larkAuth.scopeInstallGrant,
+          scopeInstallGrants: larkAuth.scopeInstallGrants,
           oauthState,
         });
         if (login.verificationUrl) {
@@ -1291,6 +1541,7 @@ export function createPluginEntry(overrides = {}) {
               missing,
               requiredScopes: larkAuth.scopes,
               scopeInstallGrant: larkAuth.scopeInstallGrant,
+              scopeInstallGrants: larkAuth.scopeInstallGrants,
               identity,
               openId: user?.openId,
             });
@@ -1309,6 +1560,7 @@ export function createPluginEntry(overrides = {}) {
               scopes: missing,
               requiredScopes: larkAuth.scopes,
               scopeInstallGrant: larkAuth.scopeInstallGrant,
+              scopeInstallGrants: larkAuth.scopeInstallGrants,
               identity,
               authReason,
               ...(oauthState ? { oauthState } : {}),
@@ -1374,8 +1626,215 @@ export function createPluginEntry(overrides = {}) {
         return;
       }
     }
-    resumeOutstandingAuthPolls();
+
+    async function sendInstallAuthForApp(app, manifest, installAuthConfig) {
+      const larkAuth = buildManifestAppAuth(app);
+      if (!larkAuth?.scopes?.length) return;
+      const accountId = app.accountId || null;
+      if (!accountId) {
+        fileLog(`installAuth skipped app=${app.key || "<unknown>"} reason=missing-accountId`);
+        return;
+      }
+      const authTargetKey = `${accountId}::install-auth::${app.key || accountId}`;
+      const ctx = {
+        accountId,
+        account: accountId,
+        appId: app.appId || null,
+        feishuAppId: app.appId || null,
+      };
+      const runtime = await ensureFeishuRuntimeHealth(ctx);
+      if (!runtime.ok) {
+        fileLog(`installAuth skipped app=${app.key || accountId} reason=runtime-unavailable error=${runtime.error || "unknown"}`);
+        return;
+      }
+      if (runtime.accountId) augmentCtxWithFeishuAccount(ctx, runtime.accountId);
+
+      const appScopeEntries = await getAppScopeEntries(ctx, { forceRefresh: true }).catch(() => null);
+      const appScopeCheck = await checkScopes(larkAuth.scopes, ctx, {
+        identity: larkAuth.identity,
+        appScopeEntries,
+        scopeInstallGrant: larkAuth.scopeInstallGrant,
+        scopeInstallGrants: larkAuth.scopeInstallGrants,
+      });
+      const userGrantScopes = filterScopesNeedingUserGrant(larkAuth.scopes, appScopeEntries, {
+        scopeInstallGrant: larkAuth.scopeInstallGrant,
+        scopeInstallGrants: larkAuth.scopeInstallGrants,
+      });
+
+      let authReason = "app_scope";
+      let missing = appScopeCheck.missing?.length ? appScopeCheck.missing : [];
+      let oauthState = null;
+      if (appScopeCheck.ok && larkAuth.identity === "app") {
+        fileLog(`installAuth app=${app.key || accountId} already authorized for app identity`);
+        return;
+      }
+
+      let recipient = { ...installAuthConfig };
+      if (!recipient.receiveId || larkAuth.identity === "user") {
+        const resolvedRecipient = await resolveInstallAuthRecipient(ctx, {
+          ...(recipient.openId ? { openId: recipient.openId } : {}),
+          ...(recipient.profile ? { profile: recipient.profile } : {}),
+        }).catch((error) => ({
+          ok: false,
+          reasonCode: "runtime_unavailable",
+          detail: error?.message || String(error),
+        }));
+        if (!resolvedRecipient?.ok) {
+          fileLog(`installAuth skipped app=${app.key || accountId} reason=${resolvedRecipient?.reasonCode || "recipient_unavailable"}`);
+          return;
+        }
+        recipient = {
+          receiveId: recipient.receiveId || resolvedRecipient.openId,
+          receiveIdType: "open_id",
+          openId: recipient.openId || resolvedRecipient.openId,
+          profile: resolvedRecipient.profile,
+        };
+      }
+
+      const runKey = `${manifest.hash || "nohash"}::${authTargetKey}::${recipient.receiveId}`;
+      if (installAuthRunKeys.has(runKey)) {
+        fileLog(`installAuth skipped duplicate authTargetKey="${authTargetKey}"`);
+        return;
+      }
+      installAuthRunKeys.add(runKey);
+
+      if (appScopeCheck.ok && larkAuth.identity === "user") {
+        if (!userGrantScopes.length) {
+          fileLog(`installAuth app=${app.key || accountId} already authorized; no user OAuth scopes`);
+          return;
+        }
+        if (!recipient.openId) {
+          fileLog(`installAuth skipped app=${app.key || accountId} reason=user-scope-openId-missing`);
+          return;
+        }
+        const userGrantCheck = await checkUserGrant(
+          recipient.openId,
+          userGrantScopes,
+          ctx,
+          { requireScopeDetails: true, larkProfile: recipient.profile },
+        ).catch(() => null);
+        if (userGrantCheck?.ok) {
+          fileLog(`installAuth app=${app.key || accountId} already authorized for user grant`);
+          return;
+        }
+        authReason = "user_grant";
+        missing = userGrantCheck?.missing?.length ? userGrantCheck.missing : userGrantScopes;
+        oauthState = userGrantCheck?.oauthState || null;
+      } else {
+        missing = missing.length ? missing : larkAuth.scopes;
+      }
+
+      const missingKey = (authReason === "user_grant" ? larkAuth.scopes : missing).slice().sort().join("|");
+      const loginScopes = authReason === "user_grant" ? larkAuth.scopes : missing;
+      const login = await startLogin(loginScopes, ctx, {
+        identity: larkAuth.identity,
+        authReason,
+        requiredScopes: larkAuth.scopes,
+        scopeInstallGrant: larkAuth.scopeInstallGrant,
+        scopeInstallGrants: larkAuth.scopeInstallGrants,
+        larkProfile: recipient.profile,
+        ...(oauthState ? { oauthState } : {}),
+      });
+      if (!login?.verificationUrl) {
+        fileLog(`installAuth startLogin failed app=${app.key || accountId}: ${login?.error || "unknown"}`);
+        return;
+      }
+
+      const sent = await sendAuthCard({
+        skillName: "openclaw-managed-skills",
+        missing,
+        ...login,
+        openId: recipient.openId,
+        receiveId: recipient.receiveId,
+        receiveIdType: recipient.receiveIdType,
+        accountId,
+        identity: larkAuth.identity,
+        authReason,
+        scopeGrantDual: login.scopeGrantDual,
+        userScopeCount: authReason === "app_scope" && larkAuth.identity === "user" ? userGrantScopes.length : null,
+        ...(oauthState ? { oauthState } : {}),
+      });
+      if (!sent.messageId) {
+        fileLog(`installAuth sendAuthCard failed app=${app.key || accountId}: ${sent.error || "unknown"}`);
+        return;
+      }
+
+      skillAuthCache.set(authTargetKey, {
+        missingKey,
+        lastSentAtMs: Date.now(),
+        requesterKey: recipient.openId || recipient.receiveId,
+        authReason,
+        authMessageId: sent.messageId,
+      });
+      rememberAuthCardPollSession({
+        authTargetKey,
+        skillName: "openclaw-managed-skills",
+        messageId: sent.messageId,
+        accountId,
+        authReason,
+        requesterKey: recipient.openId || recipient.receiveId,
+        deviceCode: login.deviceCode,
+        missingKey,
+        missing,
+        requiredScopes: larkAuth.scopes,
+        scopeInstallGrant: larkAuth.scopeInstallGrant,
+        identity: larkAuth.identity,
+        openId: recipient.openId,
+        larkProfile: recipient.profile,
+      });
+      fileLog(
+        `installAuth card sent app=${app.key || accountId} msg=${sent.messageId} scopes=${larkAuth.scopes.length} build=${PLUGIN_RUNTIME_BUILD}`,
+      );
+      startWaitForAuth({
+        authTargetKey,
+        skillName: "openclaw-managed-skills",
+        deviceCode: login.deviceCode,
+        missingKey,
+        openId: recipient.openId,
+        larkProfile: recipient.profile,
+        scopes: missing,
+        requiredScopes: larkAuth.scopes,
+        scopeInstallGrant: larkAuth.scopeInstallGrant,
+        scopeInstallGrants: larkAuth.scopeInstallGrants,
+        identity: larkAuth.identity,
+        authReason,
+        ...(oauthState ? { oauthState } : {}),
+        ctx,
+        authMessageId: sent.messageId,
+        authWaiter: login.authWaiter,
+        ...buildSkillAuthWaitCallbacks(authTargetKey, recipient.openId || recipient.receiveId),
+      });
+    }
+
+    async function runInstallAuthPreflight(ctx = null) {
+      const installAuthConfig = normalizeInstallAuthConfig(ctx);
+      if (!installAuthConfig) return;
+      const manifest = collectSkillAuthManifest({
+        config: activeApiConfig || {},
+        pluginConfig: cfg,
+        skillRoots: getInstallAuthSkillRoots(),
+      });
+      fileLog(
+        `installAuth manifest complete=${manifest.complete} apps=${manifest.apps.length} skills=${manifest.totals?.skills || 0} skillsWithAuth=${manifest.totals?.skillsWithAuth || 0} unresolved=${manifest.unresolved.length} errors=${manifest.errors.length}`,
+      );
+      if (manifest.errors.length) {
+        fileLog(`installAuth manifest errors=${safeJson(manifest.errors.slice(0, 10))}`);
+      }
+      if (manifest.unresolved.length) {
+        fileLog(`installAuth manifest unresolved=${safeJson(manifest.unresolved.slice(0, 10))}`);
+      }
+      for (const app of manifest.apps) {
+        await sendInstallAuthForApp(app, manifest, installAuthConfig);
+      }
+    }
+
     api.on("before_tool_call", guardToolCall, { priority: 80, timeoutMs: 40000 });
+    resumeOutstandingAuthPolls();
+    setImmediate(() => {
+      void runInstallAuthPreflight().catch((error) => {
+        fileLog(`installAuth failed: ${error?.message || error}`);
+      });
+    });
     },
   };
 }

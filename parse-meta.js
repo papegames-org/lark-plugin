@@ -181,6 +181,20 @@ function normalizeScopeGrant(value) {
   return null;
 }
 
+export function isUserOpenIdScope(scope) {
+  const text = String(scope || "").trim();
+  if (!text) return false;
+  return text.split(":").some((part) => /^(?:ou_|on_)[A-Za-z0-9]+$/iu.test(part));
+}
+
+function addScopeGrant(scopeGrantByScope, scope, grant) {
+  const normalized = String(scope || "").trim();
+  if (!normalized || isUserOpenIdScope(normalized) || !(grant === "app" || grant === "user")) return;
+  const existing = scopeGrantByScope.get(normalized) || [];
+  if (!existing.includes(grant)) existing.push(grant);
+  scopeGrantByScope.set(normalized, existing);
+}
+
 function collectScopeGrantEntries(target, scopeGrantByScope) {
   if (!Array.isArray(target)) return;
   for (const item of target) {
@@ -188,7 +202,7 @@ function collectScopeGrantEntries(target, scopeGrantByScope) {
     const scope = String(item.scope || item.name || item.id || "").trim();
     if (!scope) continue;
     const grant = normalizeScopeGrant(item.grant || item.as || item.identity);
-    if (grant) scopeGrantByScope.set(scope, grant);
+    addScopeGrant(scopeGrantByScope, scope, grant);
   }
 }
 
@@ -197,40 +211,48 @@ function normalize(la) {
   const scopeGrantByScope = new Map();
   collectScopeGrantEntries(la.scopes, scopeGrantByScope);
   for (const scope of Array.isArray(la.appScopes) ? la.appScopes : []) {
-    const normalized = String(scope || "").trim();
-    if (normalized) scopeGrantByScope.set(normalized, "app");
+    addScopeGrant(scopeGrantByScope, scope, "app");
   }
   for (const scope of Array.isArray(la.userScopes) ? la.userScopes : []) {
-    const normalized = String(scope || "").trim();
-    if (normalized) scopeGrantByScope.set(normalized, "user");
+    addScopeGrant(scopeGrantByScope, scope, "user");
   }
 
   const scopeSet = new Set();
   for (const scope of scopeGrantByScope.keys()) scopeSet.add(scope);
   for (const scope of Array.isArray(la.scopes) ? la.scopes : []) {
-    if (typeof scope === "string" && scope.trim()) scopeSet.add(scope.trim());
+    if (typeof scope === "string" && scope.trim() && !isUserOpenIdScope(scope)) scopeSet.add(scope.trim());
+  }
+  for (const scope of [...scopeSet]) {
+    if (isUserOpenIdScope(scope)) scopeSet.delete(scope);
   }
 
   const scopes = [...scopeSet];
   if (scopes.length === 0) return null;
 
   const scopeInstallGrant = {};
-  for (const [scope, grant] of scopeGrantByScope.entries()) {
-    if (grant === "app" || grant === "user") scopeInstallGrant[scope] = grant;
+  const scopeInstallGrants = {};
+  for (const [scope, grants] of scopeGrantByScope.entries()) {
+    if (!Array.isArray(grants) || grants.length === 0) continue;
+    scopeInstallGrant[scope] = grants[grants.length - 1];
+    if (grants.length > 1) scopeInstallGrants[scope] = [...grants];
   }
 
-  return {
+  const normalized = {
     identity: la.identity || "user",
     scopes,
     scopeInstallGrant,
   };
+  if (Object.keys(scopeInstallGrants).length) {
+    normalized.scopeInstallGrants = scopeInstallGrants;
+  }
+  return normalized;
 }
 
 // ---------- 公开入口 ----------
 /**
  * 读取 SKILL.md 内容，提取 larkAuth 权限声明。
  * @param {string} content - SKILL.md 文件内容
- * @returns {{ identity: string, scopes: string[], scopeInstallGrant?: Record<string, "app"|"user"> } | null}
+ * @returns {{ identity: string, scopes: string[], scopeInstallGrant?: Record<string, "app"|"user">, scopeInstallGrants?: Record<string, ("app"|"user")[]> } | null}
  */
 export function readLarkAuthFromContent(content) {
   const block = extractFrontmatter(content);

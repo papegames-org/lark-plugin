@@ -50,54 +50,120 @@ function inferNpmCacheDir() {
   return join(tmpdir(), "openclaw-skill-runtime-npm-cache");
 }
 
-function installOpenClaw() {
-  const openclawVersion = run("openclaw", ["--version"], { stdio: "pipe" });
+export function installOpenClawWorkflow(options = {}) {
+  const runCommand = options.runCommand || run;
+  const packageRoot = options.packageRoot || repoRoot();
+  const staging = options.stagingDir || mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-install-"));
+  const openclawVersion = runCommand("openclaw", ["--version"], { stdio: "pipe" });
   if (openclawVersion.status !== 0) {
-    process.stderr.write(
-      "openclaw CLI not found. Install OpenClaw first, then retry.\n",
-    );
-    process.exit(openclawVersion.status || 1);
+    return {
+      exitCode: openclawVersion.status || 1,
+      installed: false,
+      restarted: false,
+      inspected: false,
+      error: "openclaw CLI not found. Install OpenClaw first, then retry.",
+    };
   }
 
-  const staging = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-install-"));
   const env = {
     ...process.env,
     npm_config_cache: inferNpmCacheDir(),
     npm_config_update_notifier: "false",
   };
 
-  const packed = run("npm", ["pack", repoRoot()], { stdio: "pipe", cwd: staging, env });
+  const packed = runCommand("npm", ["pack", packageRoot], { stdio: "pipe", cwd: staging, env });
   if (packed.status !== 0) {
-    process.stderr.write(`${packed.stdout || ""}${packed.stderr || ""}`);
-    process.stderr.write("\nnpm pack failed; cannot produce tgz for OpenClaw install.\n");
-    process.exit(packed.status || 1);
+    return {
+      exitCode: packed.status || 1,
+      installed: false,
+      restarted: false,
+      inspected: false,
+      error: `${packed.stdout || ""}${packed.stderr || ""}\nnpm pack failed; cannot produce tgz for OpenClaw install.`.trim(),
+    };
   }
 
   const tgz = extractPackedFilename(`${packed.stdout || ""}\n${packed.stderr || ""}`);
   if (!tgz) {
-    process.stderr.write(`${packed.stdout || ""}${packed.stderr || ""}`);
-    process.stderr.write("\nUnable to find packed .tgz filename in npm output.\n");
-    process.exit(1);
+    return {
+      exitCode: 1,
+      installed: false,
+      restarted: false,
+      inspected: false,
+      error: "Unable to find packed .tgz filename in npm output.",
+    };
   }
 
   const tgzPath = join(staging, tgz);
-  const install = run("openclaw", ["plugins", "install", tgzPath], { stdio: "inherit" });
-  process.exit(install.status || 0);
+  const install = runCommand("openclaw", ["plugins", "install", tgzPath], { stdio: "inherit" });
+  if (install.status !== 0) {
+    return {
+      exitCode: install.status || 1,
+      installed: false,
+      restarted: false,
+      inspected: false,
+      error: `${install.stderr || install.stdout || "plugin installation failed"}`.trim(),
+    };
+  }
+
+  const restart = runCommand("openclaw", ["gateway", "restart"], { stdio: "pipe" });
+  if (restart.status !== 0) {
+    return {
+      exitCode: 3,
+      installed: true,
+      restarted: false,
+      inspected: false,
+      error: `plugin installed, but Gateway restart failed: ${restart.stderr || restart.stdout || `exit ${restart.status}`}`.trim(),
+    };
+  }
+
+  const inspect = runCommand(
+    "openclaw",
+    ["plugins", "inspect", "openclaw-skill-runtime", "--runtime", "--json"],
+    { stdio: "pipe" },
+  );
+  if (inspect.status !== 0) {
+    return {
+      exitCode: 4,
+      installed: true,
+      restarted: true,
+      inspected: false,
+      error: `plugin installed and Gateway restarted, but runtime inspect failed: ${inspect.stderr || inspect.stdout || `exit ${inspect.status}`}`.trim(),
+    };
+  }
+  return {
+    exitCode: 0,
+    installed: true,
+    restarted: true,
+    inspected: true,
+    inspectOutput: String(inspect.stdout || "").trim(),
+  };
 }
 
-const argv = process.argv.slice(2);
-const cmd = argv[0];
+function installOpenClaw() {
+  const outcome = installOpenClawWorkflow();
+  if (outcome.error) process.stderr.write(`${outcome.error}\n`);
+  else process.stdout.write("Plugin installed, Gateway restarted, and runtime inspect completed.\n");
+  process.exit(outcome.exitCode);
+}
 
-if (!cmd || cmd === "-h" || cmd === "--help") {
+function main(argv = process.argv.slice(2)) {
+  const cmd = argv[0];
+
+  if (!cmd || cmd === "-h" || cmd === "--help") {
+    printHelp();
+    return 0;
+  }
+
+  if (cmd === "install-openclaw") {
+    installOpenClaw();
+    return 0;
+  }
+
+  process.stderr.write(`Unknown command: ${cmd}\n`);
   printHelp();
-  process.exit(0);
+  return 2;
 }
 
-if (cmd === "install-openclaw") {
-  installOpenClaw();
-  process.exit(0);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exit(main());
 }
-
-process.stderr.write(`Unknown command: ${cmd}\n`);
-printHelp();
-process.exit(2);

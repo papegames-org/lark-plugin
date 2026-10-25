@@ -30,7 +30,7 @@ function parseArgs(argv) {
 }
 
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage"]);
-const SKIP_FILES = new Set(["package-lock.json"]);
+const SKIP_FILES = new Set([".git", "package-lock.json"]);
 const SKIP_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".tgz"]);
 const FORBIDDEN_FILE_BASENAMES = new Set([".npmrc", ".env", ".env.local", ".env.production", ".env.development", "id_rsa", "id_dsa"]);
 const FORBIDDEN_FILE_EXTS = new Set([".pem", ".p12", ".pfx", ".key"]);

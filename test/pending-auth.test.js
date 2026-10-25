@@ -15,6 +15,8 @@ import {
   markPendingAuthNoticeExhausted,
   readPendingAuthNoticeStore,
   writePendingAuthNoticeStore,
+  upsertAuthCardRecord,
+  readAuthCardRecordStore,
 } from "../pending-auth.js";
 
 test("computePendingAuthRetryDelayMs uses bounded retry backoff", () => {
@@ -139,6 +141,29 @@ test("readPendingAuthNoticeStore restores retrying notices and prunes stale exha
     assert.equal(restored.size, 1);
     assert.ok(restored.has("retrying"));
     assert.ok(!restored.has("exhausted"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("auth card records preserve the selected lark profile", () => {
+  const dir = mkdtempSync(join(tmpdir(), "openclaw-skill-runtime-card-record-"));
+  const filePath = join(dir, "auth-card-records.json");
+  try {
+    upsertAuthCardRecord(filePath, {
+      authTargetKey: "install-auth-subject",
+      authMessageId: "msg_123",
+      skillName: "openclaw-managed-skills",
+      accountId: "default",
+      authReason: "user_grant",
+      deviceCode: "device_123",
+      openId: "ou_123",
+      larkProfile: "profile-b",
+      missing: ["scope:a"],
+    }, 1000);
+
+    const restored = readAuthCardRecordStore(filePath, { nowMs: 1001 }).get("install-auth-subject");
+    assert.equal(restored.larkProfile, "profile-b");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

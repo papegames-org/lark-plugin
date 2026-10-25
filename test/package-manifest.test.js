@@ -13,5 +13,6 @@ test("package manifest omits legacy CLI helpers and extra runtime dependencies",
   assert.match(pkg.scripts?.["release:check"] || "", /check:version/u);
   assert.ok(!("dependencies" in pkg));
   assert.ok(files.includes("bin"));
+  assert.ok(files.includes("skill-auth-manifest.js"));
   assert.equal(pkg.bin?.["openclaw-skill-runtime"], "bin/openclaw-skill-runtime.js");
 });

@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readLarkAuthFromContent } from "../parse-meta.js";
-import { buildScopeGrantLoginPayload, filterScopesNeedingUserGrant } from "../utils.js";
+import {
+  buildScopeGrantLoginPayload,
+  filterScopesNeedingUserGrant,
+  listSubmittedGrantScopes,
+  sendAuthCard,
+  setPluginApiRef,
+} from "../utils.js";
 
 const IM_APP_SCOPES = [
   "im:message.p2p_msg:readonly",
@@ -73,4 +79,74 @@ test("buildScopeGrantLoginPayload does not dual grant when authReason is user_gr
   assert.equal(grant.scopeGrantDual, false);
   assert.equal(grant.tenantScopes, null);
   assert.equal(grant.userScopes, null);
+});
+
+test("submitted grant scopes stay aligned with the auth card list", async () => {
+  const scopeInstallGrant = {
+    "im:message:send_as_bot": "app",
+    "contact:user.base:readonly": "user",
+    "im:message": "user",
+  };
+  const requiredScopes = ["im:message:send_as_bot", "contact:user.base:readonly", "im:message"];
+  const missing = ["im:message:send_as_bot", "im:message"];
+  const appScopeEntries = requiredScopes.map((scope) => ({ scope, identity: "user" }));
+  const submitted = listSubmittedGrantScopes(missing, {
+    identity: "user",
+    authReason: "app_scope",
+    requiredScopes,
+    scopeInstallGrant,
+    appScopeEntries,
+  });
+  assert.deepEqual(submitted.requestedScopes, [
+    "im:message:send_as_bot",
+    "contact:user.base:readonly",
+    "im:message",
+  ]);
+  assert.equal(submitted.scopeGrantDual, true);
+  assert.notEqual(missing.length, submitted.requestedScopes.length);
+
+  const userGrant = listSubmittedGrantScopes(["im:message"], {
+    identity: "user",
+    authReason: "user_grant",
+    requiredScopes,
+    scopeInstallGrant,
+    appScopeEntries,
+  });
+  assert.deepEqual(userGrant.requestedScopes, ["contact:user.base:readonly", "im:message"]);
+
+  const calls = [];
+  setPluginApiRef({
+    tools: {
+      async feishu_im_user_message(payload) {
+        calls.push(payload);
+        return { data: { message_id: "msg_count" } };
+      },
+    },
+  });
+  try {
+    await sendAuthCard({
+      skillName: "demo",
+      missing,
+      requestedScopes: submitted.requestedScopes,
+      verificationUrl: "https://example.com/auth",
+      openId: "ou_test",
+      accountId: "acc-a",
+      identity: "user",
+      authReason: "app_scope",
+      scopeGrantDual: true,
+      userScopeCount: 99,
+    });
+  } finally {
+    setPluginApiRef(null);
+  }
+
+  const cardText = calls[0].content;
+  const bullets = cardText.match(/• `/g) || [];
+  assert.equal(bullets.length, submitted.requestedScopes.length);
+  assert.match(cardText, /（3 项）/);
+  assert.match(cardText, /\*\*3\*\* 项权限/);
+  assert.equal(cardText.includes("99"), false);
+  for (const scope of submitted.requestedScopes) {
+    assert.equal(cardText.includes(scope), true);
+  }
 });

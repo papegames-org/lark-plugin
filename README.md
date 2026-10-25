@@ -35,12 +35,15 @@
 1. 确认当前请求来自飞书通道。
 2. 找到对应的 `SKILL.md`。
 3. 读取 frontmatter 里的 `larkAuth`。
-4. 查询当前飞书应用已授权的 scopes。
-5. 若 scopes 已齐全，则直接放行。
-6. 若有缺失 scope，则发送飞书授权卡片。
-7. 若 `blockRead !== false`，则阻断这次读取或技能继续执行。
+4. 扫描 `~/.openclaw/skills`，以及 `~/.openclaw/workspace/<agent>/skills`，把其中所有 skill 声明的 scope 合并进同一次授权。
+5. 查询当前飞书应用已授权的 scopes。
+6. 若合并后的 scopes 已齐全，则直接放行。
+7. 若有缺失 scope，则发送一张飞书授权卡片，一次申请这些权限。
+8. 若 `blockRead !== false`，则阻断这次读取或技能继续执行。
 
 授权卡片发出后，插件会继续轮询授权结果；若卡片发送失败，则会把失败 notice 写入本地持久化队列并按退避策略重试。
+
+插件注册时默认扫描可见 skill 根目录，按飞书应用聚合全部 `larkAuth` scope。它优先使用显式配置的接收人；未配置时，从匹配当前飞书 `appId` 的 `lark-cli` profile 中选择唯一 `available=true`、`verified=true` 的用户。若启动时没有可用的用户身份，收到飞书消息后会使用该消息的发送人重试初始化授权。无需发送初始化口令。这个流程只负责提前提醒和开通权限；运行时读取 skill 时仍会再次校验。
 
 ## 支持的 `larkAuth` 写法
 
@@ -79,7 +82,16 @@ larkAuth:
 
 - `~/.agents/skills`
 - `<workspace>/skills`
+- `~/.openclaw/skills`
 - `~/.openclaw/workspace/skills`
+
+发起授权时，会把下面这些目录里所有 `SKILL.md` 声明的 scope 合并成一次申请：
+
+- `~/.openclaw/skills`
+- `~/.openclaw/workspace/skills`
+- `~/.openclaw/workspace/<agent>/skills`，例如 `~/.openclaw/workspace/workbench-agent/skills`
+
+当前 skill 自己的声明也会算进去。这些目录都不存在或没有可申请的 scope 时，仍只申请当前 skill。
 
 扫描策略：
 
@@ -98,6 +110,10 @@ larkAuth:
   作用：缺失权限时是否阻断本次读取或技能执行；默认 `true`。
 - `skillRoots`
   作用：覆盖默认 skill 扫描目录。
+- `defaultFeishuAccountId`
+  作用：多飞书账号但 hook 上下文没有 `accountId` 时的显式兜底账号。
+- `installAuth`
+  作用：注册插件时聚合扫描全部 skill scope，并主动发送安装授权卡片。默认启用；设置 `enabled: false` 可关闭。通常不需要配置接收人；多个 profile 无法唯一确定用户时，可配置 `openId` 和 `profile`。
 
 当前实现和 schema 都采用：
 
@@ -106,6 +122,39 @@ const blockRead = cfg.blockRead !== false;
 ```
 
 也就是不传时默认阻断。
+
+安装授权示例：
+
+```json
+{
+  "installAuth": {
+    "enabled": true,
+    "receiveId": "ou_xxx",
+    "receiveIdType": "open_id"
+  }
+}
+```
+
+默认自动模式不需要上述配置。显式关闭：
+
+```json
+{
+  "installAuth": {
+    "enabled": false
+  }
+}
+```
+
+同一飞书应用存在多个 `lark-cli` profile 时，可显式指定：
+
+```json
+{
+  "installAuth": {
+    "openId": "ou_xxx",
+    "profile": "default"
+  }
+}
+```
 
 ## 运行前提
 
@@ -147,8 +196,9 @@ npx --registry=https://registry.npmjs.org/ @jianguo_paper/openclaw-skill-runtime
 说明：
 
 - `install-openclaw` 会先在临时目录执行 `npm pack`，再调用 `openclaw plugins install <tgz>`
+- 安装成功后 helper 会调用 `openclaw gateway restart`，并执行 `openclaw plugins inspect openclaw-skill-runtime --runtime --json`
+- 插件安装失败、Gateway 重启失败和 runtime inspect 失败分别报告，不会把“已安装但未激活”误报为安装失败
 - 命令内部会使用临时 npm cache，避免宿主环境 `~/.npm` 权限问题卡住安装
-- 安装完成后仍建议重启 Gateway 并做一次 runtime inspect
 
 ### To Agent
 

@@ -19,6 +19,17 @@ test("formatUserFacingFailureSummary maps scope_missing", () => {
   assert.match(text, /缺少所需权限/u);
 });
 
+test("formatUserFacingFailureSummary maps an explicit user rejection", () => {
+  const text = formatUserFacingFailureSummary({
+    state: "denied",
+    authReason: "user_grant",
+    waiterExitCode: 1,
+  });
+  assert.match(text, /拒绝/);
+  assert.match(text, /技能已停止/);
+  assert.match(formatCardFailureHint({ state: "denied" }), /技能已停止/);
+});
+
 test("formatUserFacingFailureSummary maps registration denied", () => {
   const text = formatUserFacingFailureSummary({
     state: "cancelled",

@@ -11,7 +11,9 @@ export function normalizePathForAssert(value) {
 export function isolateOpenClawDataDir(prefix = "openclaw-skill-runtime-test-") {
   const dataDir = mkdtempSync(join(tmpdir(), prefix));
   const prevDataDir = process.env.OPENCLAW_DATA_DIR;
+  const prevHome = process.env.OPENCLAW_HOME;
   process.env.OPENCLAW_DATA_DIR = dataDir;
+  process.env.OPENCLAW_HOME = dataDir;
   resetRuntimeCaches();
   return {
     dataDir,
@@ -19,6 +21,8 @@ export function isolateOpenClawDataDir(prefix = "openclaw-skill-runtime-test-") 
       resetRuntimeCaches();
       if (prevDataDir === undefined) delete process.env.OPENCLAW_DATA_DIR;
       else process.env.OPENCLAW_DATA_DIR = prevDataDir;
+      if (prevHome === undefined) delete process.env.OPENCLAW_HOME;
+      else process.env.OPENCLAW_HOME = prevHome;
       rmSync(dataDir, { recursive: true, force: true });
     },
   };

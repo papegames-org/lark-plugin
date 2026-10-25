@@ -1,7 +1,7 @@
 {
   "id": "openclaw-skill-runtime",
   "name": "openclaw-skill-runtime",
-  "version": "1.0.1",
+  "version": "2.0.5",
   "description": "读 SKILL.md 时识别 skill 并预授权其声明的飞书 scope（metadata.openclaw.larkAuth）",
   "main": "index.js",
   "activation": {
@@ -28,6 +28,33 @@
       "defaultFeishuAccountId": {
         "type": "string",
         "description": "Fallback Feishu account ID to use when hook ctx has no account info and multiple accounts are configured. Admin must set this explicitly; plugin will never auto-guess."
+      },
+      "installAuth": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional startup-time aggregate authorization card for all configured Skill larkAuth scopes.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Scan configured Skill roots on plugin registration and send one aggregate auth card per Feishu app when scopes are missing. Default true; set false to disable."
+          },
+          "receiveId": {
+            "type": "string",
+            "description": "Feishu receive_id for the install authorization card. Use an open_id by default."
+          },
+          "receiveIdType": {
+            "type": "string",
+            "description": "Feishu receive_id_type. Defaults to open_id."
+          },
+          "openId": {
+            "type": "string",
+            "description": "User open_id used for user-grant checks. Defaults to receiveId when receiveIdType is open_id."
+          },
+          "profile": {
+            "type": "string",
+            "description": "Optional lark-cli profile name used to disambiguate multiple profiles for an explicitly configured openId."
+          }
+        }
       }
     }
   }
